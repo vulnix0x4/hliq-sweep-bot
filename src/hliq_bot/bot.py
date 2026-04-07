@@ -20,7 +20,9 @@ from hliq_bot.ml.gate import MLGate
 from hliq_bot.models import ClosedTrade, ExecEventType, MarketEvent, MarketState, RiskCheck, Side
 from hliq_bot.risk.governor import RiskGovernor
 from hliq_bot.signal.regime import Regime, RegimeState, classify_regime
+from hliq_bot.signal.session_tracker import SessionTracker
 from hliq_bot.signal.sweep_detector import SweepDetector
+from hliq_bot.signal.vwap_tracker import VWAPTracker
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +37,15 @@ class SweepBot:
         self._load_runtime_ml_state()
         self.feed = HyperliquidWsClient(config.feed)
         self.bar_builder = BarBuilder(config.strategy.timeframe_sec)
-        self.detector = SweepDetector(config.strategy)
+        self._session_tracker = SessionTracker()
+        self._vwap_tracker = VWAPTracker()
+        self.detector = SweepDetector(
+            config.strategy,
+            level_config=config.levels,
+            session_tracker=self._session_tracker,
+            vwap_tracker=self._vwap_tracker,
+            coin=config.feed.coin,
+        )
         self.risk = RiskGovernor(config.risk, config.strategy)
         self.executor = PaperOrderManager(config.strategy)
         self.ml_gate = MLGate(config.runtime)
@@ -462,6 +472,8 @@ class SweepBot:
             self._bars_closed += 1
             self._recent_bar_ranges.append(bar.range_pct)
             self._recent_closes.append(bar.close)
+            self._session_tracker.on_bar(bar)
+            self._vwap_tracker.on_bar(bar)
             signal = self.detector.on_bar(bar)
             if signal is None:
                 continue
