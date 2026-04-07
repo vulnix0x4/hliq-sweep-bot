@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 
 from hliq_bot.bot import SweepBot
-from hliq_bot.config import AppConfig, FeedConfig, ReplayConfig, RiskConfig, RuntimeConfig, StrategyConfig
+from hliq_bot.config import AppConfig, FeedConfig, LevelConfig, ReplayConfig, RiskConfig, RuntimeConfig, StrategyConfig
 from hliq_bot.models import MarketEvent, Side, TradeEvent
 
 
@@ -24,6 +24,7 @@ def _app_config(tmp_path: Path) -> AppConfig:
             ml_model_path=str(runtime_dir / "models" / "gate_model.json"),
         ),
         replay=ReplayConfig(input_path=str(runtime_dir / "market_events.jsonl")),
+        levels=LevelConfig(),
     )
 
 
