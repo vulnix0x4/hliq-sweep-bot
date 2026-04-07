@@ -166,3 +166,112 @@ def test_bot_creates_session_and_vwap_trackers(tmp_path: Path) -> None:
     bot = SweepBot(cfg)
     assert bot._session_tracker is not None
     assert bot._vwap_tracker is not None
+
+
+def test_bot_creates_workers_for_each_coin(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    cfg.feed.coins_str = "BTC,ETH,SOL"
+    bot = SweepBot(cfg)
+    assert len(bot._workers) == 3
+    assert "BTC" in bot._workers
+    assert "ETH" in bot._workers
+    assert "SOL" in bot._workers
+    # Each worker has its own independent components
+    assert bot._workers["BTC"].bar_builder is not bot._workers["ETH"].bar_builder
+    assert bot._workers["BTC"].detector is not bot._workers["ETH"].detector
+    assert bot._workers["BTC"].executor is not bot._workers["ETH"].executor
+    assert bot._workers["BTC"].session_tracker is not bot._workers["SOL"].session_tracker
+
+
+def test_events_route_to_correct_worker(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    cfg.feed.coins_str = "BTC,ETH"
+    bot = SweepBot(cfg)
+
+    btc_event = MarketEvent(
+        kind="trade",
+        ts_ms=60_000,
+        coin="BTC",
+        trade=TradeEvent(ts_ms=60_000, price=50_000.0, size=0.1, side="buy"),
+    )
+    eth_event = MarketEvent(
+        kind="trade",
+        ts_ms=60_000,
+        coin="ETH",
+        trade=TradeEvent(ts_ms=60_000, price=3_000.0, size=1.0, side="sell"),
+    )
+
+    bot._handle_event(btc_event)
+    bot._handle_event(eth_event)
+
+    # BTC worker should have a trade price logged
+    assert len(bot._workers["BTC"].recent_trade_prices) == 1
+    assert bot._workers["BTC"].recent_trade_prices[0][1] == 50_000.0
+
+    # ETH worker should have a trade price logged
+    assert len(bot._workers["ETH"].recent_trade_prices) == 1
+    assert bot._workers["ETH"].recent_trade_prices[0][1] == 3_000.0
+
+
+def test_book_events_route_to_correct_worker(tmp_path: Path) -> None:
+    from hliq_bot.models import BookTopEvent
+
+    cfg = _app_config(tmp_path)
+    cfg.feed.coins_str = "BTC,ETH"
+    bot = SweepBot(cfg)
+
+    btc_book = MarketEvent(
+        kind="book",
+        ts_ms=60_000,
+        coin="BTC",
+        book=BookTopEvent(ts_ms=60_000, best_bid=49_900.0, best_ask=50_100.0, bid_size=10.0, ask_size=8.0),
+    )
+    eth_book = MarketEvent(
+        kind="book",
+        ts_ms=60_000,
+        coin="ETH",
+        book=BookTopEvent(ts_ms=60_000, best_bid=2_990.0, best_ask=3_010.0, bid_size=50.0, ask_size=60.0),
+    )
+
+    bot._handle_event(btc_book)
+    bot._handle_event(eth_book)
+
+    assert bot._workers["BTC"].last_best_bid == 49_900.0
+    assert bot._workers["BTC"].last_bid_size == 10.0
+    assert bot._workers["ETH"].last_best_bid == 2_990.0
+    assert bot._workers["ETH"].last_ask_size == 60.0
+
+
+def test_backward_compat_single_coin(tmp_path: Path) -> None:
+    """HL_COIN=BTC (single coin) still works via backward-compat properties."""
+    cfg = _app_config(tmp_path)
+    # Default FeedConfig has coins_str="BTC" which is the single-coin default
+    bot = SweepBot(cfg)
+    assert len(bot._workers) == 1
+    assert "BTC" in bot._workers
+    # Backward-compat attributes point to the first worker
+    assert bot.bar_builder is bot._workers["BTC"].bar_builder
+    assert bot.detector is bot._workers["BTC"].detector
+    assert bot.executor is bot._workers["BTC"].executor
+
+
+def test_feed_config_coins_property() -> None:
+    from hliq_bot.config import FeedConfig
+    fc = FeedConfig(coins_str="BTC,ETH,SOL")
+    assert fc.coins == ["BTC", "ETH", "SOL"]
+    assert fc.coin == "BTC"  # backward compat: first coin
+
+    fc2 = FeedConfig(coins_str="ETH")
+    assert fc2.coins == ["ETH"]
+    assert fc2.coin == "ETH"
+
+    # Test whitespace handling
+    fc3 = FeedConfig(coins_str=" btc , eth ")
+    assert fc3.coins == ["BTC", "ETH"]
+
+
+def test_portfolio_position_limit_config() -> None:
+    from hliq_bot.config import RiskConfig
+    rc = RiskConfig(portfolio_max_positions=5, max_positions_per_coin=2)
+    assert rc.portfolio_max_positions == 5
+    assert rc.max_positions_per_coin == 2

@@ -35,7 +35,7 @@ class HyperliquidWsClient:
                     max_size=2**23,
                 ) as ws:
                     await self._subscribe(ws)
-                    log.info("Connected to Hyperliquid WS, coin=%s", self.config.coin)
+                    log.info("Connected to Hyperliquid WS, coins=%s", self.config.coins)
 
                     async for message in ws:
                         self.last_message_ms = int(time.time() * 1000)
@@ -49,10 +49,10 @@ class HyperliquidWsClient:
                 await asyncio.sleep(self.config.reconnect_backoff_sec)
 
     async def _subscribe(self, ws: Any) -> None:
-        subs: list[dict[str, Any]] = [
-            {"method": "subscribe", "subscription": {"type": "trades", "coin": self.config.coin}},
-            {"method": "subscribe", "subscription": {"type": "l2Book", "coin": self.config.coin}},
-        ]
+        subs: list[dict[str, Any]] = []
+        for coin in self.config.coins:
+            subs.append({"method": "subscribe", "subscription": {"type": "trades", "coin": coin}})
+            subs.append({"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}})
         if self.config.subscribe_user and self.config.user_address:
             subs.append(
                 {
@@ -78,6 +78,10 @@ class HyperliquidWsClient:
         data = payload.get("data")
         now_ms = int(time.time() * 1000)
 
+        # Extract coin from the subscription data.
+        # Hyperliquid includes coin in the data payload or the subscription context.
+        coin = self._extract_coin(data)
+
         if "trades" in channel.lower():
             for t in self._extract_trades(data):
                 price = _to_float(t.get("px", t.get("price")))
@@ -93,15 +97,29 @@ class HyperliquidWsClient:
                     if side_raw in {"sell", "s", "ask", "a"}
                     else "unknown"
                 )
+                # Per-trade coin field overrides the top-level if present.
+                trade_coin = str(t.get("coin", "")).strip().upper() or coin
                 trade = TradeEvent(ts_ms=ts_ms, price=price, size=size, side=side)
-                events.append(MarketEvent(kind="trade", ts_ms=ts_ms, trade=trade, raw=payload))
+                events.append(MarketEvent(kind="trade", ts_ms=ts_ms, coin=trade_coin, trade=trade, raw=payload))
 
         if "l2" in channel.lower():
             book = self._extract_book_top(data, now_ms)
             if book is not None:
-                events.append(MarketEvent(kind="book", ts_ms=book.ts_ms, book=book, raw=payload))
+                events.append(MarketEvent(kind="book", ts_ms=book.ts_ms, coin=coin, book=book, raw=payload))
 
         return events
+
+    def _extract_coin(self, data: Any) -> str:
+        """Extract coin identifier from the WS data payload."""
+        if isinstance(data, dict):
+            coin = str(data.get("coin", "")).strip().upper()
+            if coin:
+                return coin
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            coin = str(data[0].get("coin", "")).strip().upper()
+            if coin:
+                return coin
+        return ""
 
     def _extract_trades(self, data: Any) -> list[dict[str, Any]]:
         if isinstance(data, list):
