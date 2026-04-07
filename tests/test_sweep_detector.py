@@ -202,3 +202,33 @@ def test_detector_does_not_hard_skip_trending_context() -> None:
     )
 
     assert signal is not None
+
+
+def test_signal_score_includes_level_type_weight() -> None:
+    cfg = StrategyConfig(
+        timeframe_sec=60,
+        min_sweep_bps=4.0,
+        max_sweep_bps=40.0,
+        min_reclaim_bps=2.0,
+        volume_lookback_bars=5,
+        volume_spike_mult=1.1,
+        wick_body_ratio_min=1.2,
+    )
+    det = SweepDetector(cfg)
+
+    bar = _bar(0, o=100.95, h=101.25, l=100.70, c=100.85, v=240.0, spread=1.0)
+
+    signal_base = det._short_signal(
+        bar,
+        short_levels=[("prior_15m_high", 101.0)],
+        avg_vol=100.0,
+    )
+    signal_pdh = det._short_signal(
+        bar,
+        short_levels=[("pdh", 101.0)],
+        avg_vol=100.0,
+    )
+
+    assert signal_base is not None
+    assert signal_pdh is not None
+    assert signal_pdh.signal_score > signal_base.signal_score

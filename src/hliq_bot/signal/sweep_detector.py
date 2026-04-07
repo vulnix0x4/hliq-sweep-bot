@@ -3,14 +3,46 @@ from __future__ import annotations
 from collections import Counter
 from collections import deque
 
-from hliq_bot.config import StrategyConfig
+from hliq_bot.config import LevelConfig, StrategyConfig
 from hliq_bot.models import Bar, Side, SweepSignal
 from hliq_bot.signal.levels import derive_levels
+from hliq_bot.signal.session_tracker import SessionTracker
+from hliq_bot.signal.vwap_tracker import VWAPTracker
+
+_LEVEL_TYPE_WEIGHT: dict[str, float] = {
+    "pdh": 0.05,
+    "pdl": 0.05,
+    "vwap_daily": 0.04,
+    "session_open_current": 0.03,
+    "session_open_prior": 0.03,
+    "prior_session_high": 0.02,
+    "prior_session_low": 0.02,
+}
+
+
+def _level_type_bonus(label: str) -> float:
+    for prefix, bonus in _LEVEL_TYPE_WEIGHT.items():
+        if label == prefix or label.startswith(prefix):
+            return bonus
+    if label.startswith("round_"):
+        return 0.01
+    return 0.0
 
 
 class SweepDetector:
-    def __init__(self, config: StrategyConfig) -> None:
+    def __init__(
+        self,
+        config: StrategyConfig,
+        level_config: LevelConfig | None = None,
+        session_tracker: SessionTracker | None = None,
+        vwap_tracker: VWAPTracker | None = None,
+        coin: str = "BTC",
+    ) -> None:
         self.cfg = config
+        self._level_config = level_config
+        self._session_tracker = session_tracker
+        self._vwap_tracker = vwap_tracker
+        self._coin = coin
         self._bars_1h = max(1, int((60 * 60) / max(1, config.timeframe_sec)))
         bars_15m = max(1, int((15 * 60) / max(1, config.timeframe_sec)))
         self._min_history_bars = max(
@@ -31,7 +63,16 @@ class SweepDetector:
         if len(history) < self._min_history_bars:
             self._diag_counts["skip_history"] += 1
         else:
-            levels = derive_levels(history, self.cfg.timeframe_sec, self.cfg.equal_level_band_bps)
+            levels = derive_levels(
+                history,
+                self.cfg.timeframe_sec,
+                self.cfg.equal_level_band_bps,
+                level_config=self._level_config,
+                session_tracker=self._session_tracker,
+                vwap_tracker=self._vwap_tracker,
+                current_price=bar.close,
+                coin=self._coin,
+            )
             avg_vol = self._avg_volume(history)
             if avg_vol <= 0:
                 self._diag_counts["skip_avg_volume"] += 1
@@ -129,6 +170,8 @@ class SweepDetector:
                 stop_distance_abs=stop_dist,
                 entry_price=entry,
             )
+            bonus = _level_type_bonus(label)
+            score = max(0.0, min(1.0, score + bonus))
             signal = SweepSignal(
                 side=Side.SHORT,
                 level=level,
@@ -203,6 +246,8 @@ class SweepDetector:
                 stop_distance_abs=stop_dist,
                 entry_price=entry,
             )
+            bonus = _level_type_bonus(label)
+            score = max(0.0, min(1.0, score + bonus))
             signal = SweepSignal(
                 side=Side.LONG,
                 level=level,
