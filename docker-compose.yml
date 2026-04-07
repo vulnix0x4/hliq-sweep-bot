@@ -1,0 +1,17 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hliq-sweep-bot:latest
+    container_name: hliq-paper-bot
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - ./runtime:/app/runtime
+      - ${CODEX_AUTH_DIR:-/home/vulnix/.codex}:/root/.codex:ro
+    command:
+      - sh
+      - -lc
+      - mkdir -p /app/runtime && python -m hliq_bot.main 2>&1 | tee -a /app/runtime/bot.log
