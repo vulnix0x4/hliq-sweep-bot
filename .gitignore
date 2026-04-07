@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+runtime/bot.log
+runtime/market_events.jsonl
+runtime/signals.jsonl
+runtime/replay_signals.jsonl
