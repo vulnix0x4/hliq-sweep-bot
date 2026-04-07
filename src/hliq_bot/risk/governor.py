@@ -151,13 +151,20 @@ class RiskGovernor:
             "high_vol": 0.0,
             "illiquid": 0.0,
         }.get(regime, 1.0)
-        session_mult = {
-            "us": 1.0,
-            "eu": 0.95,
-            "asia": 0.9,
-            "late": 0.85,
-        }.get(session, 1.0)
+        session_mult = self._session_performance_multiplier(session)
         return regime_mult * session_mult
+
+    def _session_performance_multiplier(self, session: str) -> float:
+        s = (session or "").strip().lower()
+        if not s:
+            return 1.0
+        recent = self._recent_r_by_session.get(s)
+        min_n = max(1, self.risk_cfg.min_trades_for_perf_scaling)
+        if recent is None or len(recent) < min_n:
+            return 1.0  # neutral until we have data
+        avg_r = sum(recent) / len(recent)
+        mult = 1.0 + max(-0.3, min(0.3, avg_r * 0.6))
+        return max(0.5, min(1.3, mult))
 
     def can_trade_side(self, side: Side, ts_ms: int | None = None) -> RiskCheck:
         if self._in_side_hard_loss_cooldown(side, ts_ms):
