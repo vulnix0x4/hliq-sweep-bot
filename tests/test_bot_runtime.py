@@ -138,3 +138,10 @@ def test_run_replay_updates_summary_without_live_clock(tmp_path: Path) -> None:
     summary = bot.run_replay(events)
     assert int(summary["trade_events"]) == 2
     assert int(summary["bars_closed"]) == 1
+
+
+def test_bot_creates_session_and_vwap_trackers(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    bot = SweepBot(cfg)
+    assert bot._session_tracker is not None
+    assert bot._vwap_tracker is not None
