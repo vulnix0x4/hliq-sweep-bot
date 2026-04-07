@@ -162,6 +162,17 @@ class PaperOrderManager:
             out.extend(self._close_position(trade.ts_ms, trade.price, "max_hold", pnl_fn))
             return out
 
+        # Early exit: if deeply negative after early_exit_sec, cut losses
+        if (
+            self.cfg.early_exit_sec > 0
+            and elapsed_sec >= self.cfg.early_exit_sec
+            and p.risk_dollars > 0
+        ):
+            unrealized_r = self._unrealized_pnl(trade.price) / p.risk_dollars
+            if unrealized_r <= self.cfg.early_exit_r_threshold:
+                out.extend(self._close_position(trade.ts_ms, trade.price, "early_exit", pnl_fn))
+                return out
+
         if elapsed_sec >= self.cfg.time_stop_sec and self._unrealized_pnl(trade.price) <= 0:
             out.extend(self._close_position(trade.ts_ms, trade.price, "time_stop", pnl_fn))
             return out
@@ -246,8 +257,22 @@ class PaperOrderManager:
         if self.position is None:
             return
         p = self.position
-        if p.tp1_filled:
+
+        # After TP1: trail the stop
+        if p.tp1_filled and self.cfg.trail_after_tp1:
+            trail = max(0.0, min(1.0, self.cfg.trail_factor))
+            if trail > 0:
+                if p.side == Side.LONG:
+                    new_stop = p.entry_price + (p.best_price - p.entry_price) * trail
+                    if new_stop > p.stop_price:
+                        p.stop_price = new_stop
+                else:
+                    new_stop = p.entry_price - (p.entry_price - p.best_price) * trail
+                    if new_stop < p.stop_price:
+                        p.stop_price = new_stop
             return
+
+        # Pre-TP1: promote to break-even at progress threshold
         progress_target = max(0.0, min(1.0, self.cfg.break_even_progress_tp1_frac))
         if progress_target <= 0:
             return

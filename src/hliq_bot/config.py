@@ -88,6 +88,15 @@ class StrategyConfig:
     warmup_qimb_scale: float = 0.5
     warmup_micro_or_logic: bool = True
     warmup_risk_mult_cap: float = 0.75
+    use_atr_targets: bool = True
+    tp1_atr_mult: float = 0.6
+    tp2_atr_mult: float = 1.4
+    min_tp1_bps: float = 25.0
+    min_tp2_bps: float = 50.0
+    trail_after_tp1: bool = True
+    trail_factor: float = 0.5
+    early_exit_sec: int = 120
+    early_exit_r_threshold: float = -0.3
 
 
 @dataclass(slots=True)
@@ -235,6 +244,15 @@ def load_config() -> AppConfig:
         warmup_qimb_scale=_env_float("BOT_WARMUP_QIMB_SCALE", 0.5),
         warmup_micro_or_logic=_env_bool("BOT_WARMUP_MICRO_OR_LOGIC", True),
         warmup_risk_mult_cap=_env_float("BOT_WARMUP_RISK_MULT_CAP", 0.75),
+        use_atr_targets=_env_bool("BOT_USE_ATR_TARGETS", True),
+        tp1_atr_mult=_env_float("BOT_TP1_ATR_MULT", 0.6),
+        tp2_atr_mult=_env_float("BOT_TP2_ATR_MULT", 1.4),
+        min_tp1_bps=_env_float("BOT_MIN_TP1_BPS", 25.0),
+        min_tp2_bps=_env_float("BOT_MIN_TP2_BPS", 50.0),
+        trail_after_tp1=_env_bool("BOT_TRAIL_AFTER_TP1", True),
+        trail_factor=_env_float("BOT_TRAIL_FACTOR", 0.5),
+        early_exit_sec=_env_int("BOT_EARLY_EXIT_SEC", 120),
+        early_exit_r_threshold=_env_float("BOT_EARLY_EXIT_R_THRESHOLD", -0.3),
     )
 
     risk = RiskConfig(
