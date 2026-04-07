@@ -1,5 +1,6 @@
 from __future__ import annotations
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import logging
@@ -17,7 +18,7 @@ from hliq_bot.data.bar_builder import BarBuilder
 from hliq_bot.data.hyperliquid_ws import HyperliquidWsClient
 from hliq_bot.execution.order_manager import PaperOrderManager
 from hliq_bot.ml.gate import MLGate
-from hliq_bot.models import ClosedTrade, ExecEventType, MarketEvent, MarketState, RiskCheck, Side
+from hliq_bot.models import ClosedTrade, ExecEventType, MarketEvent, MarketState, RiskCheck, Side, SweepSignal
 from hliq_bot.risk.governor import RiskGovernor
 from hliq_bot.signal.regime import Regime, RegimeState, classify_regime
 from hliq_bot.signal.session_tracker import SessionTracker
@@ -25,6 +26,31 @@ from hliq_bot.signal.sweep_detector import SweepDetector
 from hliq_bot.signal.vwap_tracker import VWAPTracker
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class CoinWorker:
+    """Per-coin state: bar builder, detector, executor, trackers, and microstructure data."""
+    coin: str
+    bar_builder: BarBuilder
+    detector: SweepDetector
+    executor: PaperOrderManager
+    session_tracker: SessionTracker
+    vwap_tracker: VWAPTracker
+    last_spread_bps: float = 0.0
+    last_best_bid: float = 0.0
+    last_best_ask: float = 0.0
+    last_bid_size: float = 0.0
+    last_ask_size: float = 0.0
+    recent_bar_ranges: deque = field(default_factory=lambda: deque(maxlen=20))
+    recent_closes: deque = field(default_factory=lambda: deque(maxlen=25))
+    recent_trade_prices: deque = field(default_factory=deque)
+    recent_signed_flow: deque = field(default_factory=deque)
+    bars_closed: int = 0
+    signals_seen: int = 0
+    entries_placed: int = 0
+    entries_filled: int = 0
+    positions_closed: int = 0
 
 
 class SweepBot:
@@ -36,18 +62,7 @@ class SweepBot:
         self._normalize_runtime_paths()
         self._load_runtime_ml_state()
         self.feed = HyperliquidWsClient(config.feed)
-        self.bar_builder = BarBuilder(config.strategy.timeframe_sec)
-        self._session_tracker = SessionTracker()
-        self._vwap_tracker = VWAPTracker()
-        self.detector = SweepDetector(
-            config.strategy,
-            level_config=config.levels,
-            session_tracker=self._session_tracker,
-            vwap_tracker=self._vwap_tracker,
-            coin=config.feed.coin,
-        )
         self.risk = RiskGovernor(config.risk, config.strategy)
-        self.executor = PaperOrderManager(config.strategy)
         self.ml_gate = MLGate(config.runtime)
         self.journal = SignalJournal(config.runtime.journal_path)
         self.capture = (
@@ -56,18 +71,44 @@ class SweepBot:
             else None
         )
         self._signal_context: dict[str, dict[str, float | str]] = {}
+
+        # Build per-coin workers
+        range_maxlen = max(3, config.strategy.circuit_range_bars + 3)
+        closes_maxlen = max(5, config.strategy.trend_lookback_bars + 5)
+        self._workers: dict[str, CoinWorker] = {}
+        for coin in config.feed.coins:
+            st = SessionTracker()
+            vt = VWAPTracker()
+            worker = CoinWorker(
+                coin=coin,
+                bar_builder=BarBuilder(config.strategy.timeframe_sec),
+                detector=SweepDetector(
+                    config.strategy,
+                    level_config=config.levels,
+                    session_tracker=st,
+                    vwap_tracker=vt,
+                    coin=coin,
+                ),
+                executor=PaperOrderManager(config.strategy),
+                session_tracker=st,
+                vwap_tracker=vt,
+                recent_bar_ranges=deque(maxlen=range_maxlen),
+                recent_closes=deque(maxlen=closes_maxlen),
+            )
+            self._workers[coin] = worker
+
+        # Backward-compat: expose first coin's components as top-level attributes
+        first_coin = config.feed.coin
+        _first = self._workers[first_coin]
+        self.bar_builder = _first.bar_builder
+        self.detector = _first.detector
+        self.executor = _first.executor
+        self._session_tracker = _first.session_tracker
+        self._vwap_tracker = _first.vwap_tracker
+
         self._resolved_trades = self._restore_risk_from_journal()
 
-        self._last_spread_bps = 0.0
-        self._last_best_bid = 0.0
-        self._last_best_ask = 0.0
-        self._last_bid_size = 0.0
-        self._last_ask_size = 0.0
         self._last_event_ms = 0
-        self._recent_bar_ranges: deque[float] = deque(maxlen=max(3, config.strategy.circuit_range_bars + 3))
-        self._recent_closes: deque[float] = deque(maxlen=max(5, config.strategy.trend_lookback_bars + 5))
-        self._recent_trade_prices: deque[tuple[int, float]] = deque()
-        self._recent_signed_flow: deque[tuple[int, float]] = deque()
         self._heartbeat_interval_ms = 60_000
         now_ms = self._now_ms()
         self._last_heartbeat_ms = now_ms
@@ -86,6 +127,84 @@ class SweepBot:
         now_ms = self._now_ms()
         self._last_auto_train_ms = now_ms
         self._last_auto_train_resolved = self._resolved_trades
+
+    @property
+    def _first_worker(self) -> CoinWorker:
+        return self._workers[self.cfg.feed.coin]
+
+    # Backward-compat properties: proxy per-coin state to the first worker
+    # so existing tests that set bot._last_bid_size etc. continue to work.
+    @property
+    def _last_spread_bps(self) -> float:
+        return self._first_worker.last_spread_bps
+
+    @_last_spread_bps.setter
+    def _last_spread_bps(self, v: float) -> None:
+        self._first_worker.last_spread_bps = v
+
+    @property
+    def _last_best_bid(self) -> float:
+        return self._first_worker.last_best_bid
+
+    @_last_best_bid.setter
+    def _last_best_bid(self, v: float) -> None:
+        self._first_worker.last_best_bid = v
+
+    @property
+    def _last_best_ask(self) -> float:
+        return self._first_worker.last_best_ask
+
+    @_last_best_ask.setter
+    def _last_best_ask(self, v: float) -> None:
+        self._first_worker.last_best_ask = v
+
+    @property
+    def _last_bid_size(self) -> float:
+        return self._first_worker.last_bid_size
+
+    @_last_bid_size.setter
+    def _last_bid_size(self, v: float) -> None:
+        self._first_worker.last_bid_size = v
+
+    @property
+    def _last_ask_size(self) -> float:
+        return self._first_worker.last_ask_size
+
+    @_last_ask_size.setter
+    def _last_ask_size(self, v: float) -> None:
+        self._first_worker.last_ask_size = v
+
+    @property
+    def _recent_bar_ranges(self) -> deque:
+        return self._first_worker.recent_bar_ranges
+
+    @_recent_bar_ranges.setter
+    def _recent_bar_ranges(self, v: deque) -> None:
+        self._first_worker.recent_bar_ranges = v
+
+    @property
+    def _recent_closes(self) -> deque:
+        return self._first_worker.recent_closes
+
+    @_recent_closes.setter
+    def _recent_closes(self, v: deque) -> None:
+        self._first_worker.recent_closes = v
+
+    @property
+    def _recent_trade_prices(self) -> deque:
+        return self._first_worker.recent_trade_prices
+
+    @_recent_trade_prices.setter
+    def _recent_trade_prices(self, v: deque) -> None:
+        self._first_worker.recent_trade_prices = v
+
+    @property
+    def _recent_signed_flow(self) -> deque:
+        return self._first_worker.recent_signed_flow
+
+    @_recent_signed_flow.setter
+    def _recent_signed_flow(self, v: deque) -> None:
+        self._first_worker.recent_signed_flow = v
 
     def _now_ms(self) -> int:
         if self._time_override_ms is not None:
@@ -282,11 +401,11 @@ class SweepBot:
     async def run(self) -> None:
         log.info(
             (
-                "Starting sweep bot mode=%s coin=%s timeframe=%ss ml_enabled=%s ml_mode=%s ml_provider=%s "
+                "Starting sweep bot mode=%s coins=%s timeframe=%ss ml_enabled=%s ml_mode=%s ml_provider=%s "
                 "ml_auto_train=%s interval=%ss min_resolved=%d min_new=%d warmup=%s target=%d journal=%s capture=%s"
             ),
             self.cfg.mode,
-            self.cfg.feed.coin,
+            self.cfg.feed.coins,
             self.cfg.strategy.timeframe_sec,
             self.cfg.runtime.ml_enabled,
             self.cfg.runtime.ml_decision_mode,
@@ -381,15 +500,33 @@ class SweepBot:
                 self._event_queue.task_done()
             self._maybe_heartbeat()
 
+    def _resolve_worker(self, event: MarketEvent) -> CoinWorker:
+        """Resolve the CoinWorker for an event. Falls back to first worker for untagged events."""
+        coin = event.coin
+        if coin and coin in self._workers:
+            return self._workers[coin]
+        # Backward compat: untagged events go to first worker (single-coin mode)
+        return self._first_worker
+
+    def _total_open_positions(self) -> int:
+        """Count total open positions across all coin workers."""
+        count = 0
+        for w in self._workers.values():
+            if w.executor.position is not None:
+                count += 1
+        return count
+
     def _handle_event(self, event: MarketEvent) -> None:
         self._last_event_ms = event.ts_ms
+        w = self._resolve_worker(event)
+
         if event.kind == "book" and event.book is not None:
             self._book_events += 1
-            self._last_spread_bps = event.book.spread_bps
-            self._last_best_bid = event.book.best_bid
-            self._last_best_ask = event.book.best_ask
-            self._last_bid_size = event.book.bid_size
-            self._last_ask_size = event.book.ask_size
+            w.last_spread_bps = event.book.spread_bps
+            w.last_best_bid = event.book.best_bid
+            w.last_best_ask = event.book.best_ask
+            w.last_bid_size = event.book.bid_size
+            w.last_ask_size = event.book.ask_size
             return
 
         if event.kind != "trade" or event.trade is None:
@@ -397,14 +534,14 @@ class SweepBot:
 
         self._trade_events += 1
         trade = event.trade
-        self._recent_trade_prices.append((trade.ts_ms, trade.price))
-        self._trim_recent_trade_prices(trade.ts_ms)
+        w.recent_trade_prices.append((trade.ts_ms, trade.price))
+        self._trim_recent_trade_prices_w(w, trade.ts_ms)
         sign = 1.0 if trade.side == "buy" else -1.0 if trade.side == "sell" else 0.0
         if sign != 0.0:
-            self._recent_signed_flow.append((trade.ts_ms, sign * trade.size))
-        self._trim_recent_signed_flow(trade.ts_ms)
+            w.recent_signed_flow.append((trade.ts_ms, sign * trade.size))
+        self._trim_recent_signed_flow_w(w, trade.ts_ms)
 
-        updates = self.executor.on_trade(trade)
+        updates = w.executor.on_trade(trade)
         for update in updates:
             if update.signal_id:
                 self.journal.write(
@@ -414,12 +551,15 @@ class SweepBot:
                         "ts_ms": update.ts_ms,
                         "event": update.event_type.value,
                         "message": update.message,
+                        "coin": w.coin,
                     },
                 )
             if update.event_type == ExecEventType.ENTRY_FILLED:
                 self._entries_filled += 1
+                w.entries_filled += 1
             elif update.event_type == ExecEventType.POSITION_CLOSED:
                 self._positions_closed += 1
+                w.positions_closed += 1
             log.info(update.message)
             if update.closed_trade is not None:
                 ctx = self._signal_context.pop(update.closed_trade.signal_id, {})
@@ -434,6 +574,7 @@ class SweepBot:
                     {
                         "ts_ms": update.closed_trade.closed_ms,
                         "side": update.closed_trade.side.value,
+                        "coin": w.coin,
                         "session": session,
                         "regime": regime,
                         "level_label": level_label,
@@ -467,26 +608,29 @@ class SweepBot:
                 )
                 self._maybe_auto_train()
 
-        closed_bars = self.bar_builder.on_trade(trade, self._last_spread_bps)
+        closed_bars = w.bar_builder.on_trade(trade, w.last_spread_bps)
         for bar in closed_bars:
             self._bars_closed += 1
-            self._recent_bar_ranges.append(bar.range_pct)
-            self._recent_closes.append(bar.close)
-            self._session_tracker.on_bar(bar)
-            self._vwap_tracker.on_bar(bar)
-            signal = self.detector.on_bar(bar)
+            w.bars_closed += 1
+            w.recent_bar_ranges.append(bar.range_pct)
+            w.recent_closes.append(bar.close)
+            w.session_tracker.on_bar(bar)
+            w.vwap_tracker.on_bar(bar)
+            signal = w.detector.on_bar(bar)
             if signal is None:
                 continue
             self._signals_seen += 1
+            w.signals_seen += 1
             signal_id = self._next_signal_id(bar.end_ms)
-            state = self._build_market_state(bar.end_ms)
-            regime = self._regime_state(bar.end_ms)
-            ml_features = self._signal_features(signal, state, regime, bar)
+            state = self._build_market_state_w(w, bar.end_ms)
+            regime = self._regime_state_w(w, bar.end_ms)
+            ml_features = self._signal_features_w(w, signal, state, regime, bar)
             self.journal.write(
                 "candidate",
                 signal_id,
                 {
                     "ts_ms": bar.end_ms,
+                    "coin": w.coin,
                     "side": signal.side.value,
                     "level_label": signal.level_label,
                     "entry": signal.entry_price,
@@ -510,8 +654,9 @@ class SweepBot:
                 "regime": regime.regime.value,
                 "level_label": signal.level_label,
                 "signal_score": signal.signal_score,
+                "coin": w.coin,
             }
-            if self.executor.has_exposure():
+            if w.executor.has_exposure():
                 self.journal.write(
                     "decision",
                     signal_id,
@@ -519,8 +664,25 @@ class SweepBot:
                         "ts_ms": bar.end_ms,
                         "allowed": False,
                         "reason": "existing_exposure",
+                        "coin": w.coin,
                     },
                 )
+                continue
+
+            # Portfolio-level position limit
+            if self._total_open_positions() >= self.cfg.risk.portfolio_max_positions:
+                self._signals_blocked += 1
+                self.journal.write(
+                    "decision",
+                    signal_id,
+                    {
+                        "ts_ms": bar.end_ms,
+                        "allowed": False,
+                        "reason": "portfolio_position_limit",
+                        "coin": w.coin,
+                    },
+                )
+                log.info("Signal blocked: portfolio_position_limit coin=%s", w.coin)
                 continue
 
             if self._in_funding_blackout(bar.end_ms):
@@ -532,12 +694,13 @@ class SweepBot:
                         "ts_ms": bar.end_ms,
                         "allowed": False,
                         "reason": "funding_blackout",
+                        "coin": w.coin,
                     },
                 )
                 log.info("Signal blocked: funding_blackout")
                 continue
 
-            micro_check = self._microstructure_check(signal.side)
+            micro_check = self._microstructure_check_w(w, signal.side)
             if not micro_check.allowed:
                 self._signals_blocked += 1
                 self.journal.write(
@@ -547,6 +710,7 @@ class SweepBot:
                         "ts_ms": bar.end_ms,
                         "allowed": False,
                         "reason": micro_check.reason,
+                        "coin": w.coin,
                     },
                 )
                 log.info("Signal blocked: %s", micro_check.reason)
@@ -562,6 +726,7 @@ class SweepBot:
                         "ts_ms": bar.end_ms,
                         "allowed": False,
                         "reason": session_check.reason,
+                        "coin": w.coin,
                     },
                 )
                 log.info("Signal blocked: %s", session_check.reason)
@@ -577,6 +742,7 @@ class SweepBot:
                         "ts_ms": bar.end_ms,
                         "allowed": False,
                         "reason": level_check.reason,
+                        "coin": w.coin,
                     },
                 )
                 log.info("Signal blocked: %s", level_check.reason)
@@ -592,6 +758,7 @@ class SweepBot:
                         "ts_ms": bar.end_ms,
                         "allowed": False,
                         "reason": side_check.reason,
+                        "coin": w.coin,
                     },
                 )
                 log.info("Signal blocked: %s", side_check.reason)
@@ -607,6 +774,7 @@ class SweepBot:
                         "ts_ms": bar.end_ms,
                         "allowed": False,
                         "reason": reason,
+                        "coin": w.coin,
                     },
                 )
                 log.info("Signal blocked: %s", reason)
@@ -623,6 +791,7 @@ class SweepBot:
                         "ts_ms": bar.end_ms,
                         "allowed": False,
                         "reason": reason,
+                        "coin": w.coin,
                     },
                 )
                 log.info("Signal blocked: %s", reason)
@@ -641,6 +810,7 @@ class SweepBot:
                         "reason": ml_decision.reason,
                         "ml_prob": ml_decision.probability,
                         "ml_threshold": ml_decision.threshold,
+                        "coin": w.coin,
                     },
                 )
                 log.info(
@@ -664,6 +834,7 @@ class SweepBot:
                         "reason": check.reason,
                         "ml_prob": ml_decision.probability,
                         "ml_threshold": ml_decision.threshold,
+                        "coin": w.coin,
                     },
                 )
                 continue
@@ -688,6 +859,7 @@ class SweepBot:
                         "ml_prob": ml_decision.probability,
                         "ml_threshold": ml_decision.threshold,
                         "warmup": warmup_on,
+                        "coin": w.coin,
                     },
                 )
                 continue
@@ -707,6 +879,7 @@ class SweepBot:
                         "ml_threshold": ml_decision.threshold,
                         "risk_mult": risk_mult,
                         "warmup": warmup_on,
+                        "coin": w.coin,
                     },
                 )
                 continue
@@ -722,13 +895,15 @@ class SweepBot:
                     "ml_threshold": ml_decision.threshold,
                     "risk_mult": risk_mult,
                     "warmup": warmup_on,
+                    "coin": w.coin,
                 },
             )
             self._signal_context.setdefault(signal_id, {})
             self._signal_context[signal_id]["ml_prob"] = ml_decision.probability
             self._signal_context[signal_id]["ml_threshold"] = ml_decision.threshold
-            update = self.executor.submit_entry(signal, signal_id=signal_id, qty=sizing.qty, risk_dollars=sizing.risk_dollars)
+            update = w.executor.submit_entry(signal, signal_id=signal_id, qty=sizing.qty, risk_dollars=sizing.risk_dollars)
             self._entries_placed += 1
+            w.entries_placed += 1
             self.journal.write(
                 "lifecycle",
                 signal_id,
@@ -736,11 +911,13 @@ class SweepBot:
                     "ts_ms": update.ts_ms,
                     "event": update.event_type.value,
                     "message": update.message,
+                    "coin": w.coin,
                 },
             )
             log.info(
-                "%s | id=%s label=%s regime=%s conf=%.2f score=%.2f ml_mode=%s ml_prob=%.3f ml_thr=%.3f ml_reason=%s risk_mult=%.2f warmup=%s entry=%.2f stop=%.2f tp1=%.2f tp2=%.2f qty=%.6f",
+                "%s | coin=%s id=%s label=%s regime=%s conf=%.2f score=%.2f ml_mode=%s ml_prob=%.3f ml_thr=%.3f ml_reason=%s risk_mult=%.2f warmup=%s entry=%.2f stop=%.2f tp1=%.2f tp2=%.2f qty=%.6f",
                 update.message,
+                w.coin,
                 signal_id,
                 signal.level_label,
                 regime.regime.value,
@@ -966,6 +1143,191 @@ class SweepBot:
             return RiskCheck(False, f"micro_qimb_fail:{qimb:.3f}")
         return RiskCheck(False, "micro_fail")
 
+    # --- Worker-parameterized helpers (used by _handle_event for multi-coin) ---
+
+    def _trim_recent_trade_prices_w(self, w: CoinWorker, now_ms: int) -> None:
+        cutoff = now_ms - 30_000
+        while w.recent_trade_prices and w.recent_trade_prices[0][0] < cutoff:
+            w.recent_trade_prices.popleft()
+
+    def _trim_recent_signed_flow_w(self, w: CoinWorker, now_ms: int) -> None:
+        cutoff = now_ms - 30_000
+        while w.recent_signed_flow and w.recent_signed_flow[0][0] < cutoff:
+            w.recent_signed_flow.popleft()
+
+    def _move_30s_pct_w(self, w: CoinWorker) -> float:
+        if len(w.recent_trade_prices) < 2:
+            return 0.0
+        first = w.recent_trade_prices[0][1]
+        last = w.recent_trade_prices[-1][1]
+        if first <= 0:
+            return 0.0
+        return ((last - first) / first) * 100.0
+
+    def _build_market_state_w(self, w: CoinWorker, ts_ms: int) -> MarketState:
+        now_ms = self._now_ms()
+        stale_ms = self.cfg.feed.stale_data_sec * 1000
+        data_stale = self._last_event_ms == 0 or (now_ms - self._last_event_ms > stale_ms)
+        if self.cfg.mode == "replay":
+            ws_healthy = self._last_event_ms > 0 and not data_stale
+        else:
+            ws_healthy = self.feed.last_message_ms > 0 and not data_stale
+        return MarketState(
+            ts_ms=ts_ms,
+            ws_healthy=ws_healthy,
+            data_stale=data_stale,
+            spread_bps=w.last_spread_bps,
+            recent_bar_ranges_pct=list(w.recent_bar_ranges),
+            move_30s_pct=self._move_30s_pct_w(w),
+        )
+
+    def _regime_state_w(self, w: CoinWorker, ts_ms: int) -> RegimeState:
+        closes = list(w.recent_closes)[-self.cfg.strategy.trend_lookback_bars :]
+        ranges = list(w.recent_bar_ranges)[-self.cfg.strategy.trend_lookback_bars :]
+        dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        return classify_regime(
+            closes=closes,
+            ranges_pct=ranges,
+            spread_bps=w.last_spread_bps,
+            move_30s_pct=self._move_30s_pct_w(w),
+            trend_threshold_bps=self.cfg.strategy.max_trend_move_bps,
+            high_vol_threshold_pct=self.cfg.strategy.max_bar_range_pct,
+            illiquid_spread_bps=self.cfg.strategy.max_spread_bps * 1.8,
+            hour_utc=dt.hour,
+        )
+
+    def _signed_flow_ratio_w(self, w: CoinWorker, window_ms: int) -> float:
+        signed, total_abs = self._signed_flow_stats_w(w, window_ms)
+        if total_abs <= 1e-9:
+            return 0.0
+        return signed / total_abs
+
+    def _signed_flow_abs_w(self, w: CoinWorker, window_ms: int) -> float:
+        _, total_abs = self._signed_flow_stats_w(w, window_ms)
+        return total_abs
+
+    def _signed_flow_stats_w(self, w: CoinWorker, window_ms: int) -> tuple[float, float]:
+        if window_ms <= 0:
+            return 0.0, 0.0
+        now_ts = w.recent_signed_flow[-1][0] if w.recent_signed_flow else 0
+        if now_ts <= 0:
+            return 0.0, 0.0
+        cutoff = now_ts - window_ms
+        signed = 0.0
+        total_abs = 0.0
+        for ts, sv in reversed(w.recent_signed_flow):
+            if ts < cutoff:
+                break
+            signed += sv
+            total_abs += abs(sv)
+        return signed, total_abs
+
+    def _queue_imbalance_w(self, w: CoinWorker) -> float:
+        b = max(0.0, w.last_bid_size)
+        a = max(0.0, w.last_ask_size)
+        denom = b + a
+        if denom <= 1e-9:
+            return 0.0
+        return (b - a) / denom
+
+    def _microprice_delta_bps_w(self, w: CoinWorker) -> float:
+        bid = w.last_best_bid
+        ask = w.last_best_ask
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return 0.0
+        mid = (bid + ask) / 2.0
+        if mid <= 0:
+            return 0.0
+        bsz = max(0.0, w.last_bid_size)
+        asz = max(0.0, w.last_ask_size)
+        denom = bsz + asz
+        if denom <= 1e-9:
+            return 0.0
+        micro = ((ask * bsz) + (bid * asz)) / denom
+        return ((micro - mid) / mid) * 10_000.0
+
+    def _signal_features_w(self, w: CoinWorker, signal: SweepSignal, state: MarketState, regime: RegimeState, bar) -> dict[str, float]:
+        stop_dist_bps = abs(signal.entry_price - signal.stop_price) / max(signal.entry_price, 1e-9) * 10_000.0
+        tp1_dist_bps = abs(signal.tp1_price - signal.entry_price) / max(signal.entry_price, 1e-9) * 10_000.0
+        tp2_dist_bps = abs(signal.tp2_price - signal.entry_price) / max(signal.entry_price, 1e-9) * 10_000.0
+        stop_dist_abs = abs(signal.entry_price - signal.stop_price)
+        rr_tp1 = abs(signal.tp1_price - signal.entry_price) / max(stop_dist_abs, 1e-9)
+        rr_tp2 = abs(signal.tp2_price - signal.entry_price) / max(stop_dist_abs, 1e-9)
+        flow_ratio = self._signed_flow_ratio_w(w, self.cfg.strategy.micro_flow_window_sec * 1000)
+        flow_abs = self._signed_flow_abs_w(w, self.cfg.strategy.micro_flow_window_sec * 1000)
+        queue_imb = self._queue_imbalance_w(w)
+        micro_delta_bps = self._microprice_delta_bps_w(w)
+        depth_total = max(0.0, w.last_bid_size) + max(0.0, w.last_ask_size)
+        return {
+            "side_short": 1.0 if signal.side.value == "short" else 0.0,
+            "confidence": signal.confidence,
+            "signal_score": signal.signal_score,
+            "overshoot_bps": signal.overshoot_bps,
+            "reclaim_bps": signal.reclaim_bps,
+            "volume_ratio": signal.volume_ratio,
+            "wick_ratio": signal.wick_ratio,
+            "spread_bps": state.spread_bps,
+            "move_30s_pct": state.move_30s_pct,
+            "bar_range_pct": bar.range_pct,
+            "stop_dist_bps": stop_dist_bps,
+            "tp1_dist_bps": tp1_dist_bps,
+            "tp2_dist_bps": tp2_dist_bps,
+            "rr_tp1": rr_tp1,
+            "rr_tp2": rr_tp2,
+            "flow_ratio": flow_ratio,
+            "flow_abs": flow_abs,
+            "queue_imbalance": queue_imb,
+            "microprice_delta_bps": micro_delta_bps,
+            "book_depth_total": depth_total,
+            "regime_trend": 1.0 if regime.regime == Regime.TREND else 0.0,
+            "regime_range": 1.0 if regime.regime == Regime.RANGE else 0.0,
+            "trend_bps": regime.trend_bps,
+            "avg_range_pct": regime.avg_range_pct,
+            "session_us": 1.0 if regime.session == "us" else 0.0,
+            "session_eu": 1.0 if regime.session == "eu" else 0.0,
+            "session_asia": 1.0 if regime.session == "asia" else 0.0,
+        }
+
+    def _microstructure_check_w(self, w: CoinWorker, side: Side) -> RiskCheck:
+        if not self.cfg.strategy.use_micro_confirm:
+            return RiskCheck(True, "ok")
+        flow_ratio = self._signed_flow_ratio_w(w, self.cfg.strategy.micro_flow_window_sec * 1000)
+        qimb = self._queue_imbalance_w(w)
+        min_ofi = max(0.0, self.cfg.strategy.min_ofi_ratio)
+        min_q = max(0.0, self.cfg.strategy.min_queue_imbalance)
+        warmup_on = self._in_warmup_mode()
+        soft_or = True
+        if warmup_on and self.cfg.strategy.warmup_micro_relax:
+            min_ofi *= max(0.0, self.cfg.strategy.warmup_ofi_scale)
+            min_q *= max(0.0, self.cfg.strategy.warmup_qimb_scale)
+
+        if side == Side.LONG:
+            flow_ok = flow_ratio >= min_ofi
+            q_ok = qimb >= min_q
+            micro_ok = self._microprice_delta_bps_w(w) > 0
+            if flow_ok and q_ok:
+                return RiskCheck(True, "ok")
+            if soft_or and (flow_ok or q_ok or micro_ok):
+                return RiskCheck(True, f"micro_softpass:flow={flow_ratio:.3f},qimb={qimb:.3f}")
+            if not flow_ok:
+                return RiskCheck(False, f"micro_ofi_fail:{flow_ratio:.3f}")
+            if not q_ok:
+                return RiskCheck(False, f"micro_qimb_fail:{qimb:.3f}")
+            return RiskCheck(False, "micro_fail")
+
+        flow_ok = flow_ratio <= -min_ofi
+        q_ok = qimb <= -min_q
+        micro_ok = self._microprice_delta_bps_w(w) < 0
+        if flow_ok and q_ok:
+            return RiskCheck(True, "ok")
+        if soft_or and (flow_ok or q_ok or micro_ok):
+            return RiskCheck(True, f"micro_softpass:flow={flow_ratio:.3f},qimb={qimb:.3f}")
+        if not flow_ok:
+            return RiskCheck(False, f"micro_ofi_fail:{flow_ratio:.3f}")
+        if not q_ok:
+            return RiskCheck(False, f"micro_qimb_fail:{qimb:.3f}")
+        return RiskCheck(False, "micro_fail")
+
     def _in_funding_blackout(self, ts_ms: int) -> bool:
         if not self.cfg.strategy.use_funding_blackout:
             return False
@@ -981,16 +1343,19 @@ class SweepBot:
         if now_ms - self._last_heartbeat_ms < self._heartbeat_interval_ms:
             return
         self._last_heartbeat_ms = now_ms
-        exposure = "flat"
-        if self.executor.position is not None:
-            exposure = f"position:{self.executor.position.side.value}"
-        elif self.executor.pending_entry is not None:
-            exposure = f"pending:{self.executor.pending_entry.side.value}"
+        exposures: list[str] = []
+        for coin, w in self._workers.items():
+            if w.executor.position is not None:
+                exposures.append(f"{coin}:position:{w.executor.position.side.value}")
+            elif w.executor.pending_entry is not None:
+                exposures.append(f"{coin}:pending:{w.executor.pending_entry.side.value}")
+        exposure = ",".join(exposures) if exposures else "flat"
+        first_w = self._first_worker
         log.info(
             (
                 "Heartbeat events(trade=%d book=%d) bars=%d signals=%d blocked=%d "
                 "entries(placed=%d filled=%d closed=%d) spread=%.2fbps move30s=%.3f%% "
-                "exposure=%s warmup=%s resolved=%d qsize=%d drops=%d"
+                "exposure=%s warmup=%s resolved=%d qsize=%d drops=%d coins=%s"
             ),
             self._trade_events,
             self._book_events,
@@ -1000,18 +1365,20 @@ class SweepBot:
             self._entries_placed,
             self._entries_filled,
             self._positions_closed,
-            self._last_spread_bps,
+            first_w.last_spread_bps,
             self._move_30s_pct(),
             exposure,
             self._in_warmup_mode(),
             self._resolved_trades,
             self._event_queue.qsize(),
             self._event_drop_count,
+            list(self._workers.keys()),
         )
-        diag = self.detector.consume_diagnostics(top_n=10)
-        if diag:
-            summary = ", ".join(f"{k}={v}" for k, v in diag)
-            log.info("Detector diagnostics: %s", summary)
+        for w in self._workers.values():
+            diag = w.detector.consume_diagnostics(top_n=10)
+            if diag:
+                summary = ", ".join(f"{k}={v}" for k, v in diag)
+                log.info("Detector diagnostics [%s]: %s", w.coin, summary)
         self._maybe_auto_train()
 
     def runtime_summary(self) -> dict[str, float | int]:

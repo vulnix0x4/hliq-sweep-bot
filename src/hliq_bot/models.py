@@ -37,6 +37,7 @@ class BookTopEvent:
 class MarketEvent:
     kind: str
     ts_ms: int
+    coin: str = ""
     trade: TradeEvent | None = None
     book: BookTopEvent | None = None
     raw: dict | None = None
@@ -75,6 +76,7 @@ class SweepSignal:
     confidence: float
     reason: str
     created_ms: int
+    coin: str = ""
     overshoot_bps: float = 0.0
     reclaim_bps: float = 0.0
     volume_ratio: float = 0.0
@@ -118,6 +120,7 @@ class PendingEntry:
     expiry_sec: int
     level_label: str
     risk_dollars: float
+    coin: str = ""
     signal_id: str = ""
 
 
@@ -132,6 +135,7 @@ class OpenPosition:
     qty_initial: float
     qty_remaining: float
     risk_dollars: float
+    coin: str = ""
     tp1_filled: bool = False
     realized_pnl: float = 0.0
     best_price: float = 0.0
@@ -151,6 +155,7 @@ class ClosedTrade:
     opened_ms: int
     closed_ms: int
     exit_reason: str
+    coin: str = ""
     mfe_pnl: float = 0.0
     mae_pnl: float = 0.0
     signal_id: str = ""

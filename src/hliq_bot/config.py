@@ -35,11 +35,21 @@ def _env_bool(name: str, default: bool) -> bool:
 @dataclass(slots=True)
 class FeedConfig:
     ws_url: str = "wss://api.hyperliquid.xyz/ws"
-    coin: str = "BTC"
+    coins_str: str = "BTC"  # comma-separated, e.g. "BTC,ETH,SOL"
     subscribe_user: bool = False
     user_address: str = ""
     reconnect_backoff_sec: float = 2.0
     stale_data_sec: int = 5
+
+    @property
+    def coins(self) -> list[str]:
+        return [c.strip().upper() for c in self.coins_str.split(",") if c.strip()]
+
+    @property
+    def coin(self) -> str:
+        """Backward compat: return the first coin."""
+        coins = self.coins
+        return coins[0] if coins else "BTC"
 
 
 @dataclass(slots=True)
@@ -117,6 +127,8 @@ class RiskConfig:
     max_leverage: float = 8.0
     min_qty: float = 0.0001
     max_open_positions: int = 1
+    max_positions_per_coin: int = 1
+    portfolio_max_positions: int = 3
     perf_window_trades: int = 20
     min_trades_for_perf_scaling: int = 8
     risk_mult_min: float = 0.4
@@ -192,7 +204,7 @@ class AppConfig:
 def load_config() -> AppConfig:
     feed = FeedConfig(
         ws_url=_env_str("HL_WS_URL", "wss://api.hyperliquid.xyz/ws"),
-        coin=_env_str("HL_COIN", "BTC").upper(),
+        coins_str=_env_str("HL_COINS", _env_str("HL_COIN", "BTC")).upper(),
         subscribe_user=_env_bool("HL_SUBSCRIBE_USER", False),
         user_address=_env_str("HL_USER_ADDRESS", ""),
         reconnect_backoff_sec=_env_float("HL_RECONNECT_BACKOFF_SEC", 2.0),
@@ -262,6 +274,8 @@ def load_config() -> AppConfig:
         max_leverage=_env_float("BOT_MAX_LEVERAGE", 8.0),
         min_qty=_env_float("BOT_MIN_QTY", 0.0001),
         max_open_positions=_env_int("BOT_MAX_OPEN_POSITIONS", 1),
+        max_positions_per_coin=_env_int("BOT_MAX_POSITIONS_PER_COIN", 1),
+        portfolio_max_positions=_env_int("BOT_PORTFOLIO_MAX_POSITIONS", 3),
         perf_window_trades=_env_int("BOT_PERF_WINDOW_TRADES", 20),
         min_trades_for_perf_scaling=_env_int("BOT_MIN_TRADES_FOR_PERF", 8),
         risk_mult_min=_env_float("BOT_RISK_MULT_MIN", 0.4),
