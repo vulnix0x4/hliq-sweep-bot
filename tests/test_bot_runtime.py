@@ -47,10 +47,11 @@ def test_warmup_micro_softpass_allows_one_signal_side(tmp_path: Path) -> None:
 
     check = bot._microstructure_check(Side.LONG)
     assert check.allowed is True
-    assert "warmup_micro_softpass" in check.reason
+    assert "micro_softpass" in check.reason
 
 
-def test_non_warmup_requires_both_micro_checks(tmp_path: Path) -> None:
+def test_non_warmup_or_logic_allows_single_signal(tmp_path: Path) -> None:
+    """OR logic is now always active, so a single passing signal suffices outside warmup."""
     cfg = _app_config(tmp_path)
     cfg.strategy.warmup_enabled = True
     cfg.strategy.warmup_target_resolved = 1
@@ -67,8 +68,8 @@ def test_non_warmup_requires_both_micro_checks(tmp_path: Path) -> None:
     bot._recent_signed_flow.extend([(1_000, -5.0), (2_000, -8.0)])
 
     check = bot._microstructure_check(Side.LONG)
-    assert check.allowed is False
-    assert "micro_ofi_fail" in check.reason
+    assert check.allowed is True
+    assert "micro_softpass" in check.reason
 
 
 def test_auto_train_uses_local_paths_and_persists_state(tmp_path: Path, monkeypatch) -> None:
@@ -138,6 +139,26 @@ def test_run_replay_updates_summary_without_live_clock(tmp_path: Path) -> None:
     summary = bot.run_replay(events)
     assert int(summary["trade_events"]) == 2
     assert int(summary["bars_closed"]) == 1
+
+
+def test_micro_softpass_outside_warmup(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    cfg.strategy.warmup_enabled = True
+    cfg.strategy.warmup_target_resolved = 5
+    cfg.strategy.min_ofi_ratio = 0.06
+    cfg.strategy.min_queue_imbalance = 0.03
+
+    bot = SweepBot(cfg)
+    bot._resolved_trades = 100  # well past warmup
+    # Queue imbalance passes for long, flow fails
+    bot._last_bid_size = 120.0
+    bot._last_ask_size = 100.0
+    bot._recent_signed_flow.clear()
+    bot._recent_signed_flow.extend([(1_000, -5.0), (2_000, -8.0)])
+
+    check = bot._microstructure_check(Side.LONG)
+    assert check.allowed is True
+    assert "micro_softpass" in check.reason
 
 
 def test_bot_creates_session_and_vwap_trackers(tmp_path: Path) -> None:

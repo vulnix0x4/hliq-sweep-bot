@@ -933,19 +933,20 @@ class SweepBot:
         min_ofi = max(0.0, self.cfg.strategy.min_ofi_ratio)
         min_q = max(0.0, self.cfg.strategy.min_queue_imbalance)
         warmup_on = self._in_warmup_mode()
-        soft_or = False
+        # Always use OR logic — any one microstructure signal confirming is sufficient
+        soft_or = True
         if warmup_on and self.cfg.strategy.warmup_micro_relax:
             min_ofi *= max(0.0, self.cfg.strategy.warmup_ofi_scale)
             min_q *= max(0.0, self.cfg.strategy.warmup_qimb_scale)
-            soft_or = self.cfg.strategy.warmup_micro_or_logic
 
         if side == Side.LONG:
             flow_ok = flow_ratio >= min_ofi
             q_ok = qimb >= min_q
+            micro_ok = self._microprice_delta_bps() > 0  # microprice leaning bullish
             if flow_ok and q_ok:
                 return RiskCheck(True, "ok")
-            if soft_or and (flow_ok or q_ok):
-                return RiskCheck(True, f"warmup_micro_softpass:flow={flow_ratio:.3f},qimb={qimb:.3f}")
+            if soft_or and (flow_ok or q_ok or micro_ok):
+                return RiskCheck(True, f"micro_softpass:flow={flow_ratio:.3f},qimb={qimb:.3f}")
             if not flow_ok:
                 return RiskCheck(False, f"micro_ofi_fail:{flow_ratio:.3f}")
             if not q_ok:
@@ -954,10 +955,11 @@ class SweepBot:
 
         flow_ok = flow_ratio <= -min_ofi
         q_ok = qimb <= -min_q
+        micro_ok = self._microprice_delta_bps() < 0  # microprice leaning bearish
         if flow_ok and q_ok:
             return RiskCheck(True, "ok")
-        if soft_or and (flow_ok or q_ok):
-            return RiskCheck(True, f"warmup_micro_softpass:flow={flow_ratio:.3f},qimb={qimb:.3f}")
+        if soft_or and (flow_ok or q_ok or micro_ok):
+            return RiskCheck(True, f"micro_softpass:flow={flow_ratio:.3f},qimb={qimb:.3f}")
         if not flow_ok:
             return RiskCheck(False, f"micro_ofi_fail:{flow_ratio:.3f}")
         if not q_ok:
