@@ -309,3 +309,36 @@ def test_side_and_level_hard_loss_cooldowns_are_scoped() -> None:
     # Cooldowns expire.
     assert gov.can_trade_side(Side.LONG, ts_ms=ts + 300_000).allowed is True
     assert gov.can_trade_level("prior_15m_low", ts_ms=ts + 300_000).allowed is True
+
+
+def test_session_performance_multiplier_positive_edge():
+    gov = RiskGovernor(RiskConfig(min_trades_for_perf_scaling=3), StrategyConfig())
+    # Simulate 4 winning Asia trades
+    for _ in range(4):
+        gov._recent_r_by_session["asia"].append(0.5)
+    mult = gov._session_performance_multiplier("asia")
+    assert mult > 1.0  # positive edge -> sized up
+    assert mult <= 1.3  # capped
+
+
+def test_session_performance_multiplier_negative_edge():
+    gov = RiskGovernor(RiskConfig(min_trades_for_perf_scaling=3), StrategyConfig())
+    for _ in range(4):
+        gov._recent_r_by_session["us"].append(-0.3)
+    mult = gov._session_performance_multiplier("us")
+    assert mult < 1.0  # negative edge -> sized down
+    assert mult >= 0.5  # floored
+
+
+def test_session_performance_multiplier_no_data():
+    gov = RiskGovernor(RiskConfig(min_trades_for_perf_scaling=3), StrategyConfig())
+    mult = gov._session_performance_multiplier("asia")
+    assert mult == 1.0  # neutral when no data
+
+
+def test_regime_multiplier_uses_session_performance():
+    gov = RiskGovernor(RiskConfig(min_trades_for_perf_scaling=3), StrategyConfig())
+    for _ in range(4):
+        gov._recent_r_by_session["asia"].append(0.5)
+    rm = gov.regime_multiplier("range", "asia")
+    assert rm > 1.05  # range mult * session mult > range mult alone
