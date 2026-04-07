@@ -91,6 +91,16 @@ class StrategyConfig:
 
 
 @dataclass(slots=True)
+class LevelConfig:
+    pdh_pdl: bool = True
+    session_open: bool = True
+    round_numbers: bool = True
+    vwap: bool = True
+    prior_session: bool = True
+    round_number_range_pct: float = 1.5
+
+
+@dataclass(slots=True)
 class RiskConfig:
     account_equity: float = 1000.0
     risk_per_trade_pct: float = 0.75
@@ -167,6 +177,7 @@ class AppConfig:
     risk: RiskConfig
     runtime: RuntimeConfig
     replay: ReplayConfig
+    levels: LevelConfig
 
 
 def load_config() -> AppConfig:
@@ -292,6 +303,15 @@ def load_config() -> AppConfig:
         input_path=_env_str("BOT_REPLAY_INPUT_PATH", "runtime/market_events.jsonl"),
     )
 
+    levels = LevelConfig(
+        pdh_pdl=_env_bool("BOT_LEVELS_PDH_PDL", True),
+        session_open=_env_bool("BOT_LEVELS_SESSION_OPEN", True),
+        round_numbers=_env_bool("BOT_LEVELS_ROUND_NUMBERS", True),
+        vwap=_env_bool("BOT_LEVELS_VWAP", True),
+        prior_session=_env_bool("BOT_LEVELS_PRIOR_SESSION", True),
+        round_number_range_pct=_env_float("BOT_ROUND_NUMBER_RANGE_PCT", 1.5),
+    )
+
     return AppConfig(
         mode=_env_str("BOT_MODE", "paper").lower(),
         feed=feed,
@@ -299,4 +319,5 @@ def load_config() -> AppConfig:
         risk=risk,
         runtime=runtime,
         replay=replay,
+        levels=levels,
     )
