@@ -1,0 +1,139 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sys
+
+from hliq_bot.bot import SweepBot
+from hliq_bot.config import AppConfig, FeedConfig, ReplayConfig, RiskConfig, RuntimeConfig, StrategyConfig
+from hliq_bot.models import MarketEvent, Side, TradeEvent
+
+
+def _app_config(tmp_path: Path) -> AppConfig:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    return AppConfig(
+        mode="paper",
+        feed=FeedConfig(),
+        strategy=StrategyConfig(),
+        risk=RiskConfig(),
+        runtime=RuntimeConfig(
+            runtime_dir=str(runtime_dir),
+            journal_path=str(runtime_dir / "signals.jsonl"),
+            ml_state_path=str(runtime_dir / "ml_state.json"),
+            ml_model_path=str(runtime_dir / "models" / "gate_model.json"),
+        ),
+        replay=ReplayConfig(input_path=str(runtime_dir / "market_events.jsonl")),
+    )
+
+
+def test_warmup_micro_softpass_allows_one_signal_side(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    cfg.strategy.warmup_enabled = True
+    cfg.strategy.warmup_target_resolved = 12
+    cfg.strategy.warmup_micro_relax = True
+    cfg.strategy.warmup_micro_or_logic = True
+    cfg.strategy.min_ofi_ratio = 0.06
+    cfg.strategy.min_queue_imbalance = 0.03
+
+    bot = SweepBot(cfg)
+    bot._resolved_trades = 0
+    # Queue imbalance passes for long, flow fails.
+    bot._last_bid_size = 120.0
+    bot._last_ask_size = 100.0
+    bot._recent_signed_flow.clear()
+    bot._recent_signed_flow.extend([(1_000, -5.0), (2_000, -8.0)])
+
+    check = bot._microstructure_check(Side.LONG)
+    assert check.allowed is True
+    assert "warmup_micro_softpass" in check.reason
+
+
+def test_non_warmup_requires_both_micro_checks(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    cfg.strategy.warmup_enabled = True
+    cfg.strategy.warmup_target_resolved = 1
+    cfg.strategy.warmup_micro_relax = True
+    cfg.strategy.warmup_micro_or_logic = True
+    cfg.strategy.min_ofi_ratio = 0.06
+    cfg.strategy.min_queue_imbalance = 0.03
+
+    bot = SweepBot(cfg)
+    bot._resolved_trades = 2  # warmup off
+    bot._last_bid_size = 120.0
+    bot._last_ask_size = 100.0
+    bot._recent_signed_flow.clear()
+    bot._recent_signed_flow.extend([(1_000, -5.0), (2_000, -8.0)])
+
+    check = bot._microstructure_check(Side.LONG)
+    assert check.allowed is False
+    assert "micro_ofi_fail" in check.reason
+
+
+def test_auto_train_uses_local_paths_and_persists_state(tmp_path: Path, monkeypatch) -> None:
+    cfg = _app_config(tmp_path)
+    cfg.runtime.ml_enabled = True
+    cfg.runtime.ml_provider = "logistic"
+    cfg.runtime.ml_auto_train = True
+    cfg.runtime.ml_auto_train_interval_sec = 1
+    cfg.runtime.ml_auto_train_min_resolved = 1
+    cfg.runtime.ml_auto_train_min_new_trades = 1
+    cfg.runtime.ml_auto_apply_threshold = True
+    cfg.runtime.ml_min_prob = 0.62
+
+    bot = SweepBot(cfg)
+    bot._resolved_trades = 2
+    bot._last_auto_train_resolved = 0
+    bot._last_auto_train_ms = 0
+
+    captured: dict[str, object] = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = '{"status":"ok"}'
+        stderr = ""
+
+    def _fake_run(cmd, cwd, capture_output, text, timeout):
+        captured["cmd"] = cmd
+        captured["cwd"] = cwd
+        captured["timeout"] = timeout
+        return _Proc()
+
+    monkeypatch.setattr("hliq_bot.bot.subprocess.run", _fake_run)
+    monkeypatch.setattr(bot, "_load_recommended_min_prob", lambda _p: 0.66)
+    monkeypatch.setattr(bot.ml_gate, "reload", lambda: captured.setdefault("reloaded", True))
+
+    bot._maybe_auto_train()
+
+    cmd = captured.get("cmd")
+    assert isinstance(cmd, list)
+    assert cmd[0] == sys.executable
+    assert cmd[1].endswith("scripts/train_gate.py")
+    assert captured.get("cwd") == str(bot._project_root)
+    assert captured.get("reloaded") is True
+    assert round(bot.cfg.runtime.ml_min_prob, 2) == 0.66
+
+    state_path = Path(bot.cfg.runtime.ml_state_path)
+    assert state_path.exists()
+    raw = json.loads(state_path.read_text(encoding="utf-8"))
+    assert round(float(raw.get("ml_min_prob", 0.0)), 2) == 0.66
+
+    # Validate reload from persisted state.
+    bot.cfg.runtime.ml_min_prob = 0.55
+    bot._load_runtime_ml_state()
+    assert round(bot.cfg.runtime.ml_min_prob, 2) == 0.66
+
+
+def test_run_replay_updates_summary_without_live_clock(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    bot = SweepBot(cfg)
+
+    events = [
+        MarketEvent(kind="book", ts_ms=60_000, book=None),
+        MarketEvent(kind="trade", ts_ms=60_000, trade=TradeEvent(ts_ms=60_000, price=100.0, size=1.0, side="buy")),
+        MarketEvent(kind="trade", ts_ms=120_000, trade=TradeEvent(ts_ms=120_000, price=100.1, size=1.0, side="buy")),
+    ]
+
+    summary = bot.run_replay(events)
+    assert int(summary["trade_events"]) == 2
+    assert int(summary["bars_closed"]) == 1
