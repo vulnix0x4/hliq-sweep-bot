@@ -55,6 +55,8 @@ class SweepDetector:
         )
         self._history: deque[Bar] = deque(maxlen=max_bars)
         self._diag_counts: Counter[str] = Counter()
+        self._tp1_bps: float = config.tp1_bps
+        self._tp2_bps: float = config.tp2_bps
 
     def on_bar(self, bar: Bar) -> SweepSignal | None:
         history = list(self._history)
@@ -74,6 +76,7 @@ class SweepDetector:
                 coin=self._coin,
             )
             avg_vol = self._avg_volume(history)
+            self._tp1_bps, self._tp2_bps = self._compute_tp_bps(history)
             if avg_vol <= 0:
                 self._diag_counts["skip_avg_volume"] += 1
             else:
@@ -145,8 +148,8 @@ class SweepDetector:
                 continue
             entry = level * (1 - self.cfg.retest_entry_offset_bps / 10_000.0)
             stop = bar.high * (1 + self.cfg.stop_buffer_bps / 10_000.0)
-            tp1 = entry * (1 - self.cfg.tp1_bps / 10_000.0)
-            tp2 = entry * (1 - self.cfg.tp2_bps / 10_000.0)
+            tp1 = entry * (1 - self._tp1_bps / 10_000.0)
+            tp2 = entry * (1 - self._tp2_bps / 10_000.0)
             stop_dist = abs(entry - stop)
             rr_tp1, rr_tp2 = self._rr_values(entry=entry, stop=stop, tp1=tp1, tp2=tp2)
             if not self._risk_reward_ok(entry=entry, stop=stop, tp1=tp1, tp2=tp2):
@@ -221,8 +224,8 @@ class SweepDetector:
                 continue
             entry = level * (1 + self.cfg.retest_entry_offset_bps / 10_000.0)
             stop = bar.low * (1 - self.cfg.stop_buffer_bps / 10_000.0)
-            tp1 = entry * (1 + self.cfg.tp1_bps / 10_000.0)
-            tp2 = entry * (1 + self.cfg.tp2_bps / 10_000.0)
+            tp1 = entry * (1 + self._tp1_bps / 10_000.0)
+            tp2 = entry * (1 + self._tp2_bps / 10_000.0)
             stop_dist = abs(entry - stop)
             rr_tp1, rr_tp2 = self._rr_values(entry=entry, stop=stop, tp1=tp1, tp2=tp2)
             if not self._risk_reward_ok(entry=entry, stop=stop, tp1=tp1, tp2=tp2):
@@ -275,6 +278,24 @@ class SweepDetector:
         if not look:
             return 0.0
         return sum(b.volume for b in look) / len(look)
+
+    def _atr_bps(self, history: list[Bar]) -> float:
+        look = history[-self.cfg.volume_lookback_bars :]
+        if not look:
+            return 0.0
+        # range_pct is in % (e.g., 0.2 means 0.2%), multiply by 100 to get bps
+        ranges = [b.range_pct * 100.0 for b in look]
+        return sum(ranges) / len(ranges)
+
+    def _compute_tp_bps(self, history: list[Bar]) -> tuple[float, float]:
+        if not self.cfg.use_atr_targets:
+            return self._tp1_bps, self._tp2_bps
+        atr = self._atr_bps(history)
+        if atr <= 0:
+            return self._tp1_bps, self._tp2_bps
+        tp1 = max(self.cfg.min_tp1_bps, atr * self.cfg.tp1_atr_mult)
+        tp2 = max(self.cfg.min_tp2_bps, atr * self.cfg.tp2_atr_mult)
+        return tp1, tp2
 
     def _is_trending(self, history: list[Bar]) -> bool:
         look = history[-self.cfg.trend_lookback_bars :]
