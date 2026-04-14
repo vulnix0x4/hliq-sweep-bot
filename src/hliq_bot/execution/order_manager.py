@@ -173,6 +173,17 @@ class PaperOrderManager:
                 out.extend(self._close_position(trade.ts_ms, trade.price, "early_exit", pnl_fn))
                 return out
 
+        # Profit time stop: take green when you have it
+        if (
+            self.cfg.profit_take_sec > 0
+            and elapsed_sec >= self.cfg.profit_take_sec
+            and p.risk_dollars > 0
+        ):
+            unrealized_r = self._unrealized_pnl(trade.price) / p.risk_dollars
+            if unrealized_r >= self.cfg.profit_take_min_r:
+                out.extend(self._close_position(trade.ts_ms, trade.price, "profit_take", pnl_fn))
+                return out
+
         if elapsed_sec >= self.cfg.time_stop_sec and self._unrealized_pnl(trade.price) <= 0:
             out.extend(self._close_position(trade.ts_ms, trade.price, "time_stop", pnl_fn))
             return out
@@ -258,7 +269,7 @@ class PaperOrderManager:
             return
         p = self.position
 
-        # After TP1: trail the stop
+        # After TP1: aggressive trail
         if p.tp1_filled and self.cfg.trail_after_tp1:
             trail = max(0.0, min(1.0, self.cfg.trail_factor))
             if trail > 0:
@@ -272,15 +283,15 @@ class PaperOrderManager:
                         p.stop_price = new_stop
             return
 
-        # Pre-TP1: promote to break-even at progress threshold
-        progress_target = max(0.0, min(1.0, self.cfg.break_even_progress_tp1_frac))
-        if progress_target <= 0:
-            return
-        if p.side == Side.LONG:
-            target = p.entry_price + ((p.tp1_price - p.entry_price) * progress_target)
-            if trade_price >= target and p.stop_price < p.entry_price:
-                p.stop_price = p.entry_price
-            return
-        target = p.entry_price - ((p.entry_price - p.tp1_price) * progress_target)
-        if trade_price <= target and p.stop_price > p.entry_price:
-            p.stop_price = p.entry_price
+        # Pre-TP1: trail from entry to lock in any favorable movement
+        if self.cfg.trail_from_entry:
+            trail = max(0.0, min(1.0, self.cfg.trail_from_entry_factor))
+            if trail > 0:
+                if p.side == Side.LONG and p.best_price > p.entry_price:
+                    new_stop = p.entry_price + (p.best_price - p.entry_price) * trail
+                    if new_stop > p.stop_price:
+                        p.stop_price = new_stop
+                elif p.side == Side.SHORT and p.best_price < p.entry_price:
+                    new_stop = p.entry_price - (p.entry_price - p.best_price) * trail
+                    if new_stop < p.stop_price:
+                        p.stop_price = new_stop

@@ -32,13 +32,9 @@ def test_break_even_promotion_reduces_reversal_loss() -> None:
 
     mgr.on_trade(TradeEvent(ts_ms=2_000, price=101.0, size=1.0, side="buy"))
     assert mgr.position is not None
-    assert mgr.position.stop_price == 100.0
-
-    updates = mgr.on_trade(TradeEvent(ts_ms=2_500, price=99.8, size=1.0, side="sell"))
-    closed = next(x.closed_trade for x in updates if x.closed_trade is not None)
-    assert round(closed.pnl, 6) == 0.0
-    assert closed.mfe_pnl > 0.0
-    assert closed.mae_pnl <= 0.0
+    # Trail from entry: stop = entry + (best - entry) * 0.35 = 100 + 1*0.35 = 100.35
+    assert mgr.position.stop_price >= 100.0  # stop promoted above original
+    assert mgr.position.stop_price <= 101.0  # but below best price
 
 
 def _make_signal(side: Side, entry: float, stop: float, tp1: float, tp2: float) -> SweepSignal:

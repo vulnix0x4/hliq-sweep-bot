@@ -107,6 +107,10 @@ class StrategyConfig:
     trail_factor: float = 0.5
     early_exit_sec: int = 120
     early_exit_r_threshold: float = -0.3
+    profit_take_sec: int = 60
+    profit_take_min_r: float = 0.15
+    trail_from_entry: bool = True
+    trail_from_entry_factor: float = 0.35
 
 
 @dataclass(slots=True)
@@ -265,6 +269,10 @@ def load_config() -> AppConfig:
         trail_factor=_env_float("BOT_TRAIL_FACTOR", 0.5),
         early_exit_sec=_env_int("BOT_EARLY_EXIT_SEC", 120),
         early_exit_r_threshold=_env_float("BOT_EARLY_EXIT_R_THRESHOLD", -0.3),
+        profit_take_sec=_env_int("BOT_PROFIT_TAKE_SEC", 60),
+        profit_take_min_r=_env_float("BOT_PROFIT_TAKE_MIN_R", 0.15),
+        trail_from_entry=_env_bool("BOT_TRAIL_FROM_ENTRY", True),
+        trail_from_entry_factor=_env_float("BOT_TRAIL_FROM_ENTRY_FACTOR", 0.35),
     )
 
     risk = RiskConfig(
