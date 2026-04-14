@@ -103,14 +103,17 @@ class StrategyConfig:
     tp2_atr_mult: float = 1.4
     min_tp1_bps: float = 25.0
     min_tp2_bps: float = 50.0
+    long_only: bool = True
     trail_after_tp1: bool = True
     trail_factor: float = 0.5
     early_exit_sec: int = 120
     early_exit_r_threshold: float = -0.3
-    profit_take_sec: int = 60
+    profit_take_sec: int = 0
     profit_take_min_r: float = 0.15
     trail_from_entry: bool = True
-    trail_from_entry_factor: float = 0.35
+    trail_from_entry_factor: float = 0.25
+    runner_trail_sec: int = 300
+    runner_trail_factor: float = 0.45
 
 
 @dataclass(slots=True)
@@ -265,14 +268,17 @@ def load_config() -> AppConfig:
         tp2_atr_mult=_env_float("BOT_TP2_ATR_MULT", 1.4),
         min_tp1_bps=_env_float("BOT_MIN_TP1_BPS", 25.0),
         min_tp2_bps=_env_float("BOT_MIN_TP2_BPS", 50.0),
+        long_only=_env_bool("BOT_LONG_ONLY", True),
         trail_after_tp1=_env_bool("BOT_TRAIL_AFTER_TP1", True),
         trail_factor=_env_float("BOT_TRAIL_FACTOR", 0.5),
         early_exit_sec=_env_int("BOT_EARLY_EXIT_SEC", 120),
         early_exit_r_threshold=_env_float("BOT_EARLY_EXIT_R_THRESHOLD", -0.3),
-        profit_take_sec=_env_int("BOT_PROFIT_TAKE_SEC", 60),
+        profit_take_sec=_env_int("BOT_PROFIT_TAKE_SEC", 0),
         profit_take_min_r=_env_float("BOT_PROFIT_TAKE_MIN_R", 0.15),
         trail_from_entry=_env_bool("BOT_TRAIL_FROM_ENTRY", True),
-        trail_from_entry_factor=_env_float("BOT_TRAIL_FROM_ENTRY_FACTOR", 0.35),
+        trail_from_entry_factor=_env_float("BOT_TRAIL_FROM_ENTRY_FACTOR", 0.25),
+        runner_trail_sec=_env_int("BOT_RUNNER_TRAIL_SEC", 300),
+        runner_trail_factor=_env_float("BOT_RUNNER_TRAIL_FACTOR", 0.45),
     )
 
     risk = RiskConfig(
