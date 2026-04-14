@@ -18,6 +18,7 @@ class PaperOrderManager:
         self.cfg = strategy_cfg
         self.pending_entry: PendingEntry | None = None
         self.position: OpenPosition | None = None
+        self._last_trade_ms: int = 0
 
     def has_exposure(self) -> bool:
         return self.pending_entry is not None or self.position is not None
@@ -50,6 +51,7 @@ class PaperOrderManager:
         )
 
     def on_trade(self, trade: TradeEvent) -> list[ExecutionUpdate]:
+        self._last_trade_ms = trade.ts_ms
         updates: list[ExecutionUpdate] = []
         updates.extend(self._maybe_expire_pending(trade.ts_ms))
         updates.extend(self._maybe_fill_entry(trade))
@@ -285,7 +287,13 @@ class PaperOrderManager:
 
         # Pre-TP1: trail from entry to lock in any favorable movement
         if self.cfg.trail_from_entry:
-            trail = max(0.0, min(1.0, self.cfg.trail_from_entry_factor))
+            base_trail = max(0.0, min(1.0, self.cfg.trail_from_entry_factor))
+            # Tighten trail in "runner" phase (after runner_trail_sec)
+            elapsed = (self._last_trade_ms - p.opened_ms) / 1000.0 if self._last_trade_ms > 0 else 0.0
+            if self.cfg.runner_trail_sec > 0 and elapsed >= self.cfg.runner_trail_sec:
+                trail = max(base_trail, min(1.0, self.cfg.runner_trail_factor))
+            else:
+                trail = base_trail
             if trail > 0:
                 if p.side == Side.LONG and p.best_price > p.entry_price:
                     new_stop = p.entry_price + (p.best_price - p.entry_price) * trail

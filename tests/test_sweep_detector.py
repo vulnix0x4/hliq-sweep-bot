@@ -28,6 +28,7 @@ def test_short_sweep_signal_triggers() -> None:
         volume_lookback_bars=10,
         volume_spike_mult=1.2,
         wick_body_ratio_min=1.5,
+        long_only=False,
     )
     det = SweepDetector(cfg)
 
@@ -178,6 +179,7 @@ def test_detector_does_not_hard_skip_trending_context() -> None:
         volume_lookback_bars=10,
         volume_spike_mult=1.2,
         wick_body_ratio_min=1.5,
+        long_only=False,
     )
     det = SweepDetector(cfg)
     det._is_trending = lambda history: True  # type: ignore[method-assign]

@@ -105,7 +105,7 @@ class SweepDetector:
             self._diag_counts["skip_spread"] += 1
             return None
 
-        short_signal = self._short_signal(bar, short_levels, avg_vol)
+        short_signal = None if self.cfg.long_only else self._short_signal(bar, short_levels, avg_vol)
         long_signal = self._long_signal(bar, long_levels, avg_vol)
         if short_signal is None and long_signal is None:
             return None

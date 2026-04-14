@@ -107,3 +107,55 @@ def test_no_early_exit_when_not_deeply_negative():
     updates = mgr.on_trade(TradeEvent(ts_ms=132000, price=99.9, size=1.0))
     closed = [u for u in updates if u.closed_trade is not None]
     assert len(closed) == 0  # should NOT early exit
+
+
+def test_runner_trail_tightens_after_threshold():
+    cfg = StrategyConfig(
+        trail_from_entry=True, trail_from_entry_factor=0.25,
+        runner_trail_sec=300, runner_trail_factor=0.45,
+        pending_entry_expiry_sec=300, entry_touch_tolerance_bps=10.0,
+        max_holding_sec=1800, time_stop_sec=240,
+    )
+    mgr = PaperOrderManager(cfg)
+    sig = _make_signal(Side.LONG, entry=100.0, stop=98.0, tp1=103.0, tp2=106.0)
+    mgr.submit_entry(sig, "s1", qty=1.0, risk_dollars=2.0)
+
+    # Fill
+    mgr.on_trade(TradeEvent(ts_ms=1000, price=100.0, size=1.0))
+    assert mgr.position is not None
+
+    # Price goes to 102 early — trail at 25%: stop = 100 + 2*0.25 = 100.5
+    mgr.on_trade(TradeEvent(ts_ms=10000, price=102.0, size=1.0))
+    assert mgr.position.stop_price >= 100.4
+    assert mgr.position.stop_price <= 100.6
+    early_stop = mgr.position.stop_price
+
+    # After 300s, same price 102 — runner trail at 45%: stop = 100 + 2*0.45 = 100.9
+    mgr.on_trade(TradeEvent(ts_ms=302000, price=102.0, size=1.0))
+    assert mgr.position is not None
+    assert mgr.position.stop_price > early_stop  # tightened
+    assert mgr.position.stop_price >= 100.8
+
+
+def test_long_only_skips_shorts():
+    cfg = StrategyConfig(
+        timeframe_sec=60,
+        min_sweep_bps=4.0, max_sweep_bps=40.0,
+        min_reclaim_bps=2.0,
+        volume_lookback_bars=5, volume_spike_mult=1.1,
+        wick_body_ratio_min=1.2,
+        long_only=True,
+    )
+    from hliq_bot.signal.sweep_detector import SweepDetector
+    det = SweepDetector(cfg)
+    from hliq_bot.models import Bar
+    bar = Bar(start_ms=0, end_ms=60000, open=100.95, high=101.25, low=100.70, close=100.85,
+              volume=240.0, trade_count=50, vwap=100.9, avg_spread_bps=1.0)
+    # This would be a valid short signal but long_only should skip it
+    signal = det._find_signal(
+        bar,
+        short_levels=[("prior_15m_high", 101.0)],
+        long_levels=[],
+        avg_vol=100.0,
+    )
+    assert signal is None
