@@ -203,6 +203,43 @@ def test_side_edge_pause_cooldown_expires_and_releases_side() -> None:
     assert still_allowed.allowed is True
 
 
+def test_roll_day_clears_session_and_level_deques() -> None:
+    gov = RiskGovernor(
+        risk_cfg=RiskConfig(
+            account_equity=1000.0,
+            risk_per_trade_pct=1.0,
+            session_edge_pause_avg_r=-0.2,
+            session_edge_pause_min_trades=2,
+            level_edge_pause_avg_r=-0.2,
+            level_edge_pause_min_trades=2,
+            loss_cooldown_sec=0,
+            edge_pause_min_trades=50,
+            daily_loss_limit_r=20.0,
+        ),
+        strategy_cfg=StrategyConfig(),
+    )
+    day1 = 1_700_000_000_000
+    gov.register_closed_trade(
+        _closed_trade(day1 + 1_000, r_multiple=-0.5),
+        session="us",
+        level_label="prior_15m_low",
+    )
+    gov.register_closed_trade(
+        _closed_trade(day1 + 2_000, r_multiple=-0.4),
+        session="us",
+        level_label="prior_15m_low",
+    )
+
+    assert gov.can_trade_session("us").allowed is False
+    assert gov.can_trade_level("prior_15m_low").allowed is False
+
+    day3 = day1 + 2 * 86_400_000
+    gov.can_open_new_trade(_market_state(ts_ms=day3))
+
+    assert gov.can_trade_session("us").allowed is True
+    assert gov.can_trade_level("prior_15m_low").allowed is True
+
+
 def test_session_and_level_edge_pause() -> None:
     ts = 1_700_500_000_000
     gov = RiskGovernor(
