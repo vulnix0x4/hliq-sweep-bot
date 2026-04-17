@@ -270,6 +270,8 @@ class RiskGovernor:
         day_key = self._day_key_from_ms(ts_ms)
         if day_key != self._daily.day_key:
             self._daily = _DailyStats(day_key=day_key)
+            self._recent_r_by_session.clear()
+            self._recent_r_by_level.clear()
 
     def _day_key_from_ms(self, ts_ms: int) -> str:
         dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
