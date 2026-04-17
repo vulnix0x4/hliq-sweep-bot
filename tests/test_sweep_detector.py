@@ -206,6 +206,20 @@ def test_detector_does_not_hard_skip_trending_context() -> None:
     assert signal is not None
 
 
+def test_wick_ratio_is_bounded_on_doji_bars() -> None:
+    det = SweepDetector(StrategyConfig())
+    doji = _bar(0, o=100.0, h=100.5, l=99.5, c=100.0, v=10.0)
+    assert det._wick_ratio_long(doji) <= 20.0
+    assert det._wick_ratio_short(doji) <= 20.0
+
+
+def test_wick_ratio_still_sensible_on_normal_bars() -> None:
+    det = SweepDetector(StrategyConfig())
+    bar = _bar(0, o=100.0, h=100.3, l=99.0, c=100.5, v=10.0)
+    ratio = det._wick_ratio_long(bar)
+    assert 1.5 <= ratio <= 20.0
+
+
 def test_signal_score_includes_level_type_weight() -> None:
     cfg = StrategyConfig(
         timeframe_sec=60,
