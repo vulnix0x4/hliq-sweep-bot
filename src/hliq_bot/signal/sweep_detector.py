@@ -308,14 +308,16 @@ class SweepDetector:
         return volume >= avg_volume * self.cfg.volume_spike_mult
 
     def _wick_ratio_short(self, bar: Bar) -> float:
-        body = max(abs(bar.close - bar.open), 1e-9)
+        body_floor = max((bar.high - bar.low) * 0.01, 1e-9)
+        body = max(abs(bar.close - bar.open), body_floor)
         upper_wick = max(0.0, bar.high - max(bar.open, bar.close))
-        return upper_wick / body
+        return min(upper_wick / body, 20.0)
 
     def _wick_ratio_long(self, bar: Bar) -> float:
-        body = max(abs(bar.close - bar.open), 1e-9)
+        body_floor = max((bar.high - bar.low) * 0.01, 1e-9)
+        body = max(abs(bar.close - bar.open), body_floor)
         lower_wick = max(0.0, min(bar.open, bar.close) - bar.low)
-        return lower_wick / body
+        return min(lower_wick / body, 20.0)
 
     def _confidence(self, wick_ratio: float, volume_ratio: float, overshoot_ratio: float) -> float:
         score = 0.0
