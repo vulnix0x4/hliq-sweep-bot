@@ -28,6 +28,7 @@ def load_market_events(path: str) -> Iterator[MarketEvent]:
             ts_ms = _safe_int(row.get("ts_ms"))
             if ts_ms <= 0:
                 continue
+            coin = str(row.get("coin", "")).strip().upper()
 
             if kind == "trade":
                 price = _safe_float(row.get("price"))
@@ -37,6 +38,7 @@ def load_market_events(path: str) -> Iterator[MarketEvent]:
                 yield MarketEvent(
                     kind="trade",
                     ts_ms=ts_ms,
+                    coin=coin,
                     trade=TradeEvent(
                         ts_ms=ts_ms,
                         price=price,
@@ -54,6 +56,7 @@ def load_market_events(path: str) -> Iterator[MarketEvent]:
                 yield MarketEvent(
                     kind="book",
                     ts_ms=ts_ms,
+                    coin=coin,
                     book=BookTopEvent(
                         ts_ms=ts_ms,
                         best_bid=best_bid,

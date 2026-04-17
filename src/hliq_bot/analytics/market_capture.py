@@ -24,6 +24,9 @@ class MarketCaptureWriter:
             "kind": event.kind,
             "ts_ms": event.ts_ms,
         }
+        coin = (event.coin or "").strip().upper()
+        if coin:
+            row["coin"] = coin
         if event.trade is not None:
             row.update(
                 {
