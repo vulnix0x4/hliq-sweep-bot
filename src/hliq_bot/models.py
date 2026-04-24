@@ -138,6 +138,7 @@ class OpenPosition:
     coin: str = ""
     tp1_filled: bool = False
     realized_pnl: float = 0.0
+    realized_fees: float = 0.0  # cumulative fees+rebates from entry + any partial exits
     best_price: float = 0.0
     worst_price: float = 0.0
     signal_id: str = ""
@@ -159,6 +160,8 @@ class ClosedTrade:
     mfe_pnl: float = 0.0
     mae_pnl: float = 0.0
     signal_id: str = ""
+    fees_paid: float = 0.0  # net fees (positive = paid, negative = received)
+    pnl_gross: float = 0.0  # pnl before fees
 
 
 class ExecEventType(str, Enum):

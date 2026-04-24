@@ -137,6 +137,108 @@ def test_runner_trail_tightens_after_threshold():
     assert mgr.position.stop_price >= 100.8
 
 
+def test_fee_modeling_on_stop_loss_exit():
+    """Maker rebate on entry, taker fee on stop_loss exit.
+    HL Tier 0: maker = -0.015% (rebate), taker = +0.045% (fee).
+    $3000 notional round-trip -> entry_fee = -$0.45, exit_fee ≈ +$1.35, net ≈ +$0.90.
+    """
+    cfg = StrategyConfig(
+        maker_fee_pct=-0.00015,
+        taker_fee_pct=0.00045,
+        pending_entry_expiry_sec=300,
+        entry_touch_tolerance_bps=10.0,
+    )
+    mgr = PaperOrderManager(cfg)
+    # 30 qty × $100 = $3000 entry notional
+    sig = _make_signal(Side.LONG, entry=100.0, stop=98.0, tp1=103.0, tp2=106.0)
+    mgr.submit_entry(sig, "s1", qty=30.0, risk_dollars=60.0)
+    mgr.on_trade(TradeEvent(ts_ms=2000, price=100.0, size=30.0))
+    assert mgr.position is not None
+
+    # Price drops to stop -> stop_loss exit at 98.0 (taker)
+    updates = mgr.on_trade(TradeEvent(ts_ms=3000, price=98.0, size=30.0))
+    closed = [u for u in updates if u.closed_trade is not None]
+    assert len(closed) == 1
+    ct = closed[0].closed_trade
+    assert ct.exit_reason == "stop_loss"
+
+    # Gross PnL: (98 - 100) * 30 = -60
+    assert round(ct.pnl_gross, 2) == -60.00
+    # Entry fee (maker): 100 * 30 * -0.00015 = -0.45 (rebate received)
+    # Exit fee (taker):   98 * 30 * +0.00045 = +1.323
+    # Net fees paid: -0.45 + 1.323 = 0.873
+    assert 0.85 <= ct.fees_paid <= 0.90
+    # Net PnL: -60 - 0.873 = -60.873
+    assert round(ct.pnl, 2) == round(ct.pnl_gross - ct.fees_paid, 2)
+    assert ct.pnl < ct.pnl_gross  # fees make PnL worse
+
+
+def test_fee_modeling_on_winning_trade():
+    """Net fees should still be paid on a winning trade."""
+    cfg = StrategyConfig(
+        maker_fee_pct=-0.00015,
+        taker_fee_pct=0.00045,
+        pending_entry_expiry_sec=300,
+        entry_touch_tolerance_bps=10.0,
+        max_holding_sec=100,  # force max_hold quickly
+    )
+    mgr = PaperOrderManager(cfg)
+    sig = _make_signal(Side.LONG, entry=100.0, stop=98.0, tp1=103.0, tp2=106.0)
+    mgr.submit_entry(sig, "s1", qty=30.0, risk_dollars=60.0)
+    mgr.on_trade(TradeEvent(ts_ms=2000, price=100.0, size=30.0))
+
+    # Price rises to 101, then time_stop fires (quick max_hold)
+    updates = mgr.on_trade(TradeEvent(ts_ms=102_001, price=101.0, size=30.0))
+    closed = [u for u in updates if u.closed_trade is not None]
+    assert len(closed) == 1
+    ct = closed[0].closed_trade
+
+    # Gross: +30, fees positive (net cost), net PnL = 30 - ~0.88 = ~29.12
+    assert round(ct.pnl_gross, 2) == 30.00
+    assert ct.fees_paid > 0  # net fees paid even on winner
+    assert ct.pnl < ct.pnl_gross
+
+
+def test_fee_modeling_with_tp1_partial_exit():
+    """TP1 partial is maker (limit fill), final close is taker."""
+    cfg = StrategyConfig(
+        maker_fee_pct=-0.00015,
+        taker_fee_pct=0.00045,
+        trail_after_tp1=True,
+        trail_factor=0.5,
+        pending_entry_expiry_sec=300,
+        entry_touch_tolerance_bps=10.0,
+    )
+    mgr = PaperOrderManager(cfg)
+    sig = _make_signal(Side.LONG, entry=100.0, stop=98.0, tp1=103.0, tp2=106.0)
+    mgr.submit_entry(sig, "s1", qty=30.0, risk_dollars=60.0)
+    mgr.on_trade(TradeEvent(ts_ms=2000, price=100.0, size=30.0))
+
+    # Hit TP1 at 103 — partial 15 qty filled as maker (rebate)
+    mgr.on_trade(TradeEvent(ts_ms=3000, price=103.0, size=30.0))
+    assert mgr.position.tp1_filled
+    assert mgr.position.realized_fees < 0  # entry rebate + tp1 rebate = negative (we've been paid)
+
+    # Now price drops to stop at BE (100) -> taker close
+    updates = mgr.on_trade(TradeEvent(ts_ms=4000, price=100.0, size=30.0))
+    closed = [u for u in updates if u.closed_trade is not None]
+    assert len(closed) == 1
+    ct = closed[0].closed_trade
+
+    # Entry maker fee: 100*30*-0.00015 = -0.45
+    # TP1 maker fee on 15 qty: 103*15*-0.00015 = -0.232
+    # Final taker fee on 15 qty at 100: 100*15*+0.00045 = +0.675
+    # Net: -0.45 - 0.232 + 0.675 = -0.007 (close to zero — rebates roughly balance taker)
+    assert -0.05 <= ct.fees_paid <= 0.10
+
+
+def test_fee_default_values_match_hl_tier0():
+    """Defaults should be HL Tier 0 rates (can be overridden via env)."""
+    cfg = StrategyConfig()
+    assert cfg.maker_fee_pct == -0.00015
+    assert cfg.taker_fee_pct == 0.00045
+
+
 def test_long_only_skips_shorts():
     cfg = StrategyConfig(
         timeframe_sec=60,
