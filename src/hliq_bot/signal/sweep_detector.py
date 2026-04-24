@@ -338,23 +338,47 @@ class SweepDetector:
         stop_distance_abs: float,
         entry_price: float,
     ) -> float:
-        reclaim_score = min(reclaim_bps / max(self.cfg.min_reclaim_bps, 1e-9), 2.5) / 2.5
-        volume_score = min(volume_ratio / max(self.cfg.volume_spike_mult, 1e-9), 2.0) / 2.0
-        wick_score = min(wick_ratio / max(self.cfg.wick_body_ratio_min, 1e-9), 2.0) / 2.0
-        rr_score = min(((rr_tp1 / max(self.cfg.min_rr_tp1, 1e-9)) + (rr_tp2 / max(self.cfg.min_rr_tp2, 1e-9))) / 2.0, 2.0) / 2.0
-        stop_bps = (stop_distance_abs / max(entry_price, 1e-9)) * 10_000.0
-        mid_sweep = (self.cfg.min_sweep_bps + self.cfg.max_sweep_bps) / 2.0
-        sweep_penalty = min(abs(overshoot_bps - mid_sweep) / max(self.cfg.max_sweep_bps, 1e-9), 1.0)
-        stop_penalty = min(abs(stop_bps - mid_sweep) / max(self.cfg.max_stop_distance_bps, 1e-9), 1.0)
+        """Rank a sweep signal by the features that empirically predict outcomes.
+
+        Based on Spearman + quartile analysis of 185 historical outcomes:
+        - wick_ratio: Q4-Q1 = +0.285R — strongest bar-level predictor (highest weight)
+        - reclaim_bps: modestly positive
+        - volume_ratio: SWEET-SPOT around 2x; high volume (>5x) LOSES (Q4-Q1 = -0.40R)
+        - overshoot_bps: SWEET-SPOT around 6bps; deep overshoots (>12bps) LOSE (Q4-Q1 = -0.45R)
+        - confidence: ρ = -0.12 (ANTI-predictive) — dropped from positive contribution
+        - rr_tp2:     ρ = -0.305 (MOST anti-predictive) — dropped from positive contribution
+
+        The old formula gave 45% weight to `confidence` and 15% to rr — both anti-predictive.
+        This rewrite routes weight to features that actually predict wins.
+        """
+        # Primary: wick_ratio. Saturate at 6x (empirical strong rejection candle).
+        wick_norm = min(wick_ratio / 6.0, 1.0)
+
+        # Secondary: reclaim strength. Saturate at 3x the min_reclaim threshold.
+        reclaim_cap = max(self.cfg.min_reclaim_bps * 3.0, 1e-9)
+        reclaim_norm = min(reclaim_bps / reclaim_cap, 1.0)
+
+        # Volume sweet-spot: peaks at ~2x avg, degrades either side. Top quartile (>5x) LOSES.
+        vol_sweet = max(0.0, 1.0 - abs(volume_ratio - 2.0) / 3.0)
+
+        # Overshoot sweet-spot: best around 6bps. Deep sweeps (Q4) lose.
+        overshoot_sweet = max(0.0, 1.0 - abs(overshoot_bps - 6.0) / 10.0)
+
         score = (
-            (confidence * 0.45)
-            + (reclaim_score * 0.20)
-            + (rr_score * 0.15)
-            + (volume_score * 0.10)
-            + (wick_score * 0.10)
+            (wick_norm * 0.45)
+            + (reclaim_norm * 0.25)
+            + (vol_sweet * 0.15)
+            + (overshoot_sweet * 0.15)
         )
-        score -= sweep_penalty * 0.05
-        score -= stop_penalty * 0.05
+
+        # Explicit penalty for extreme overshoot beyond the sweet-spot floor.
+        if overshoot_bps > 12.0:
+            score -= 0.15 * min((overshoot_bps - 12.0) / 12.0, 1.0)
+
+        # Explicit penalty for extreme volume (>5x historically LOSES).
+        if volume_ratio > 5.0:
+            score -= 0.15 * min((volume_ratio - 5.0) / 10.0, 1.0)
+
         return max(0.0, min(score, 1.0))
 
     def _risk_reward_ok(self, entry: float, stop: float, tp1: float, tp2: float) -> bool:
