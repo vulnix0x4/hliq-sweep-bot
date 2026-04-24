@@ -114,6 +114,11 @@ class StrategyConfig:
     trail_from_entry_factor: float = 0.25
     runner_trail_sec: int = 300
     runner_trail_factor: float = 0.45
+    # Fee model (Hyperliquid Tier 0 perp defaults: -0.015% maker rebate, +0.045% taker fee).
+    # Applied in PaperOrderManager: entry assumed maker, taker-style exits (stop_loss,
+    # max_hold, time_stop, early_exit, profit_take) pay taker; tp1/tp2 limit exits pay maker.
+    maker_fee_pct: float = -0.00015
+    taker_fee_pct: float = 0.00045
 
 
 @dataclass(slots=True)
@@ -279,6 +284,8 @@ def load_config() -> AppConfig:
         trail_from_entry_factor=_env_float("BOT_TRAIL_FROM_ENTRY_FACTOR", 0.25),
         runner_trail_sec=_env_int("BOT_RUNNER_TRAIL_SEC", 300),
         runner_trail_factor=_env_float("BOT_RUNNER_TRAIL_FACTOR", 0.45),
+        maker_fee_pct=_env_float("BOT_MAKER_FEE_PCT", -0.00015),
+        taker_fee_pct=_env_float("BOT_TAKER_FEE_PCT", 0.00045),
     )
 
     risk = RiskConfig(

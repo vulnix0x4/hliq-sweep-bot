@@ -579,6 +579,8 @@ class SweepBot:
                         "regime": regime,
                         "level_label": level_label,
                         "pnl": update.closed_trade.pnl,
+                        "pnl_gross": update.closed_trade.pnl_gross,
+                        "fees_paid": update.closed_trade.fees_paid,
                         "r_multiple": update.closed_trade.r_multiple,
                         "mfe_pnl": update.closed_trade.mfe_pnl,
                         "mae_pnl": update.closed_trade.mae_pnl,

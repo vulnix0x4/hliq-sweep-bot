@@ -90,6 +90,8 @@ class PaperOrderManager:
         if not touched:
             return []
 
+        entry_notional = pe.entry_price * pe.qty
+        entry_fee = entry_notional * self.cfg.maker_fee_pct  # maker (limit posted at retest)
         self.position = OpenPosition(
             signal_id=pe.signal_id,
             side=pe.side,
@@ -101,6 +103,7 @@ class PaperOrderManager:
             qty_initial=pe.qty,
             qty_remaining=pe.qty,
             risk_dollars=max(pe.risk_dollars, self._position_risk(pe.entry_price, pe.stop_price, pe.qty)),
+            realized_fees=entry_fee,
             best_price=pe.entry_price,
             worst_price=pe.entry_price,
         )
@@ -142,6 +145,8 @@ class PaperOrderManager:
             p.realized_pnl += pnl
             p.qty_remaining -= qty
             p.tp1_filled = True
+            # TP1 is a limit (maker) fill at the take-profit price.
+            p.realized_fees += (p.tp1_price * qty) * self.cfg.maker_fee_pct
             # Reduce tail risk after first scale.
             p.stop_price = p.entry_price
             out.append(
@@ -202,7 +207,13 @@ class PaperOrderManager:
         if self.position is None:
             return []
         p = self.position
-        pnl = p.realized_pnl + pnl_fn(exit_price, p.qty_remaining)
+        pnl_gross = p.realized_pnl + pnl_fn(exit_price, p.qty_remaining)
+        # Final exit: tp2 fills as maker (limit), all other reasons are taker-style.
+        final_exit_is_maker = reason == "tp2"
+        final_fee_pct = self.cfg.maker_fee_pct if final_exit_is_maker else self.cfg.taker_fee_pct
+        final_exit_fee = (exit_price * p.qty_remaining) * final_fee_pct
+        fees_paid = p.realized_fees + final_exit_fee
+        pnl_net = pnl_gross - fees_paid
         total_qty = p.qty_initial
         risk = max(p.risk_dollars, 1e-9)
         hold_sec = max(0.0, (ts_ms - p.opened_ms) / 1000.0)
@@ -212,9 +223,11 @@ class PaperOrderManager:
             entry_price=p.entry_price,
             exit_price=exit_price,
             qty=total_qty,
-            pnl=pnl,
+            pnl=pnl_net,
+            pnl_gross=pnl_gross,
+            fees_paid=fees_paid,
             risk_dollars=risk,
-            r_multiple=pnl / risk,
+            r_multiple=pnl_net / risk,
             opened_ms=p.opened_ms,
             closed_ms=ts_ms,
             exit_reason=reason,
@@ -226,7 +239,7 @@ class PaperOrderManager:
             ExecutionUpdate(
                 ts_ms=ts_ms,
                 event_type=ExecEventType.POSITION_CLOSED,
-                message=f"position closed ({reason}): pnl={pnl:.2f} r={closed.r_multiple:.2f} hold_sec={hold_sec:.1f}",
+                message=f"position closed ({reason}): pnl={pnl_net:.2f} r={closed.r_multiple:.2f} hold_sec={hold_sec:.1f} fees={fees_paid:.2f}",
                 signal_id=p.signal_id,
                 closed_trade=closed,
             )
