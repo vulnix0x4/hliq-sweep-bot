@@ -140,6 +140,15 @@ def test_detector_history_warmup_is_not_one_hour() -> None:
 
 
 def test_detector_picks_best_ranked_level_not_first_match() -> None:
+    """Detector picks the highest-signal-score level, not just the first match.
+
+    Under the new (data-grounded) scoring formula: the level at 101.18 gives a
+    moderate overshoot of ~6.9bps (sweet spot) and strong reclaim of ~32.6bps,
+    while the level at 101.0 gives an extreme overshoot of ~24.75bps (deep
+    overshoots lose empirically). The first-position 'moderate_overshoot' label
+    SHOULD be preferred — the test verifies the detector ranks by score, not
+    by list position.
+    """
     cfg = StrategyConfig(
         timeframe_sec=60,
         min_sweep_bps=4.0,
@@ -151,6 +160,8 @@ def test_detector_picks_best_ranked_level_not_first_match() -> None:
     )
     det = SweepDetector(cfg)
 
+    # Put the weaker level first in the list to test that the detector
+    # evaluates all levels and picks by score, not by iteration order.
     signal = det._short_signal(
         _bar(
             0,
@@ -161,13 +172,13 @@ def test_detector_picks_best_ranked_level_not_first_match() -> None:
             v=240.0,
             spread=1.0,
         ),
-        short_levels=[("weaker_first", 101.18), ("stronger_second", 101.0)],
+        short_levels=[("deep_overshoot_first", 101.0), ("moderate_overshoot", 101.18)],
         avg_vol=100.0,
     )
 
     assert signal is not None
     assert signal.signal_score > 0.0
-    assert signal.level_label == "stronger_second"
+    assert signal.level_label == "moderate_overshoot"
 
 
 def test_detector_does_not_hard_skip_trending_context() -> None:
@@ -218,6 +229,114 @@ def test_wick_ratio_still_sensible_on_normal_bars() -> None:
     bar = _bar(0, o=100.0, h=100.3, l=99.0, c=100.5, v=10.0)
     ratio = det._wick_ratio_long(bar)
     assert 1.5 <= ratio <= 20.0
+
+
+def test_signal_score_is_monotonic_in_wick_ratio() -> None:
+    """Higher wick_ratio should produce a higher signal_score.
+    wick_ratio Q4-Q1 = +0.285R on 185 historical outcomes -- strongest bar-level predictor."""
+    det = SweepDetector(StrategyConfig())
+    kwargs = dict(
+        confidence=0.80,
+        reclaim_bps=4.0,
+        volume_ratio=2.0,
+        overshoot_bps=5.0,
+        rr_tp1=1.5,
+        rr_tp2=3.0,
+        stop_distance_abs=15.0,
+        entry_price=100.0,
+    )
+    s_low = det._signal_score(wick_ratio=1.2, **kwargs)
+    s_mid = det._signal_score(wick_ratio=3.0, **kwargs)
+    s_high = det._signal_score(wick_ratio=6.0, **kwargs)
+    assert s_low < s_mid < s_high, f"expected monotonic in wick: {s_low=} {s_mid=} {s_high=}"
+
+
+def test_signal_score_penalizes_extreme_overshoot() -> None:
+    """overshoot_bps Q4-Q1 = -0.45R historically -- deep sweeps LOSE.
+    Extreme overshoot should score lower than moderate."""
+    det = SweepDetector(StrategyConfig())
+    kwargs = dict(
+        confidence=0.80,
+        reclaim_bps=4.0,
+        volume_ratio=2.0,
+        wick_ratio=3.0,
+        rr_tp1=1.5,
+        rr_tp2=3.0,
+        stop_distance_abs=15.0,
+        entry_price=100.0,
+    )
+    s_moderate = det._signal_score(overshoot_bps=5.0, **kwargs)
+    s_extreme = det._signal_score(overshoot_bps=22.0, **kwargs)
+    assert s_extreme < s_moderate, f"expected penalty for extreme overshoot: {s_moderate=} {s_extreme=}"
+
+
+def test_signal_score_penalizes_extreme_volume() -> None:
+    """volume_ratio Q4-Q1 = -0.40R historically -- very high volume bars LOSE.
+    Volume > 5x should score lower than moderate volume (~2x sweet spot)."""
+    det = SweepDetector(StrategyConfig())
+    kwargs = dict(
+        confidence=0.80,
+        reclaim_bps=4.0,
+        wick_ratio=3.0,
+        overshoot_bps=5.0,
+        rr_tp1=1.5,
+        rr_tp2=3.0,
+        stop_distance_abs=15.0,
+        entry_price=100.0,
+    )
+    s_moderate = det._signal_score(volume_ratio=2.0, **kwargs)
+    s_extreme = det._signal_score(volume_ratio=12.0, **kwargs)
+    assert s_extreme < s_moderate, f"expected penalty for extreme volume: {s_moderate=} {s_extreme=}"
+
+
+def test_signal_score_does_not_reward_extreme_rr_tp2() -> None:
+    """rr_tp2 has Spearman = -0.305 with outcome R -- ANTI-predictive.
+    A higher rr_tp2 should NOT produce a materially higher signal_score.
+    (A tight stop yields high rr_tp2 but also more stop-outs.)"""
+    det = SweepDetector(StrategyConfig())
+    kwargs = dict(
+        confidence=0.80,
+        reclaim_bps=4.0,
+        volume_ratio=2.0,
+        wick_ratio=3.0,
+        overshoot_bps=5.0,
+        rr_tp1=1.5,
+        stop_distance_abs=15.0,
+        entry_price=100.0,
+    )
+    s_low_rr = det._signal_score(rr_tp2=2.0, **kwargs)
+    s_high_rr = det._signal_score(rr_tp2=8.0, **kwargs)
+    # Allow small tolerance; the point is rr_tp2 should NOT be a big positive driver.
+    assert s_high_rr <= s_low_rr + 0.05, f"rr_tp2 should not dominate: {s_low_rr=} {s_high_rr=}"
+
+
+def test_signal_score_bounded_in_unit_interval() -> None:
+    """signal_score must stay within [0, 1] regardless of inputs."""
+    det = SweepDetector(StrategyConfig())
+    extreme = det._signal_score(
+        confidence=1.0,
+        reclaim_bps=100.0,
+        volume_ratio=50.0,
+        wick_ratio=20.0,
+        overshoot_bps=0.1,
+        rr_tp1=10.0,
+        rr_tp2=20.0,
+        stop_distance_abs=1.0,
+        entry_price=100.0,
+    )
+    zero_ish = det._signal_score(
+        confidence=0.0,
+        reclaim_bps=0.0,
+        volume_ratio=0.0,
+        wick_ratio=0.0,
+        overshoot_bps=100.0,
+        rr_tp1=0.0,
+        rr_tp2=0.0,
+        stop_distance_abs=100.0,
+        entry_price=100.0,
+    )
+    assert 0.0 <= extreme <= 1.0
+    assert 0.0 <= zero_ish <= 1.0
 
 
 def test_signal_score_includes_level_type_weight() -> None:
