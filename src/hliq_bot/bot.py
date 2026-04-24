@@ -844,7 +844,12 @@ class SweepBot:
             perf_mult = self.risk.performance_multiplier()
             regime_mult = self.risk.regime_multiplier(regime.regime.value, regime.session)
             ml_mult = self._ml_risk_multiplier(ml_decision.probability, ml_decision.threshold)
-            risk_mult = perf_mult * regime_mult * ml_mult
+            # Signal-quality multiplier: scale size by the (rewritten, data-grounded)
+            # signal_score. Conservative range [0.8, 1.2]: low-quality setups take 80% size,
+            # top-tier setups take 120%. The governor still clamps the final product to
+            # [risk_mult_min, risk_mult_max].
+            signal_quality_mult = max(0.8, min(1.2, 0.8 + 0.4 * float(signal.signal_score)))
+            risk_mult = perf_mult * regime_mult * ml_mult * signal_quality_mult
             warmup_on = self._in_warmup_mode()
             if warmup_on:
                 cap = max(self.cfg.risk.risk_mult_min, self.cfg.strategy.warmup_risk_mult_cap)

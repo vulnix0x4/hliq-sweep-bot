@@ -28,6 +28,29 @@ def _app_config(tmp_path: Path) -> AppConfig:
     )
 
 
+def test_signal_quality_mult_mapping() -> None:
+    """Verify the signal_score -> size multiplier mapping used in bot.py risk_mult.
+
+    Formula: max(0.8, min(1.2, 0.8 + 0.4 * signal_score))
+    - score 0.0 -> 0.8  (low-quality signals take 80% size)
+    - score 0.5 -> 1.0  (neutral at median score)
+    - score 1.0 -> 1.2  (top-tier signals take 120% size)
+    - clamped so final size never exceeds [0.8, 1.2] before governor clamps.
+    """
+
+    def mult(score: float) -> float:
+        return max(0.8, min(1.2, 0.8 + 0.4 * score))
+
+    assert mult(0.0) == 0.8
+    assert abs(mult(0.3) - 0.92) < 1e-9
+    assert abs(mult(0.5) - 1.0) < 1e-9
+    assert abs(mult(0.75) - 1.1) < 1e-9
+    assert abs(mult(1.0) - 1.2) < 1e-9
+    # Clamp protection in case of bad inputs
+    assert mult(-1.0) == 0.8
+    assert mult(5.0) == 1.2
+
+
 def test_warmup_micro_softpass_allows_one_signal_side(tmp_path: Path) -> None:
     cfg = _app_config(tmp_path)
     cfg.strategy.warmup_enabled = True
