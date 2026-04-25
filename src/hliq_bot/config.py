@@ -198,6 +198,18 @@ class RuntimeConfig:
 
 
 @dataclass(slots=True)
+class LiveConfig:
+    """Live (real-money) execution settings. Default safe = OFF."""
+    allow_live: bool = False  # MUST be explicitly set to true to allow live
+    network: str = "testnet"  # "testnet" or "mainnet"
+    agent_private_key: str = ""  # private key of the agent wallet (NOT main)
+    main_wallet_address: str = ""  # main wallet that approved the agent
+    max_notional_per_trade: float = 200.0  # hard cap; refuse orders above this
+    deadman_cancel_sec: int = 60  # auto-cancel-all if bot doesn't refresh
+    deadman_refresh_sec: int = 30  # how often to push the cancel timer forward
+
+
+@dataclass(slots=True)
 class ReplayConfig:
     input_path: str = "runtime/market_events.jsonl"
 
@@ -211,6 +223,7 @@ class AppConfig:
     runtime: RuntimeConfig
     replay: ReplayConfig
     levels: LevelConfig
+    live: LiveConfig
 
 
 def load_config() -> AppConfig:
@@ -365,6 +378,16 @@ def load_config() -> AppConfig:
         round_number_range_pct=_env_float("BOT_ROUND_NUMBER_RANGE_PCT", 1.5),
     )
 
+    live = LiveConfig(
+        allow_live=_env_bool("BOT_ALLOW_LIVE", False),
+        network=_env_str("HL_NETWORK", "testnet").lower(),
+        agent_private_key=_env_str("HL_AGENT_PRIVATE_KEY", ""),
+        main_wallet_address=_env_str("HL_MAIN_WALLET_ADDRESS", ""),
+        max_notional_per_trade=_env_float("HL_MAX_NOTIONAL_PER_TRADE", 200.0),
+        deadman_cancel_sec=_env_int("HL_DEADMAN_CANCEL_SEC", 60),
+        deadman_refresh_sec=_env_int("HL_DEADMAN_REFRESH_SEC", 30),
+    )
+
     return AppConfig(
         mode=_env_str("BOT_MODE", "paper").lower(),
         feed=feed,
@@ -373,4 +396,5 @@ def load_config() -> AppConfig:
         runtime=runtime,
         replay=replay,
         levels=levels,
+        live=live,
     )
