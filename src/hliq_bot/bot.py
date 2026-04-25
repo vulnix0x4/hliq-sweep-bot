@@ -542,6 +542,11 @@ class SweepBot:
 
     def _handle_event(self, event: MarketEvent) -> None:
         self._last_event_ms = event.ts_ms
+        # Deadman switch: refresh per-tick (gated by should_refresh_deadman) so the
+        # actual SDK push fires every deadman_refresh_sec with safety margin against
+        # heartbeat-cadence jitter. Heartbeat (60s) would only give ~30s effective
+        # cadence which equals deadman_cancel_sec — zero margin.
+        self._maybe_refresh_deadmans(self._now_ms())
         w = self._resolve_worker(event)
 
         if event.kind == "book" and event.book is not None:
@@ -1410,12 +1415,16 @@ class SweepBot:
             if diag:
                 summary = ", ".join(f"{k}={v}" for k, v in diag)
                 log.info("Detector diagnostics [%s]: %s", w.coin, summary)
-        # Deadman switch: push HL's schedule_cancel timer forward each heartbeat
-        # so HL auto-cancels our resting orders if the bot dies.
+        self._maybe_auto_train()
+
+    def _maybe_refresh_deadmans(self, now_ms: int) -> None:
+        """Push HL's schedule_cancel timer forward when the per-executor refresh
+        cadence is due. Called per market-tick (NOT per-heartbeat) so the actual
+        SDK push fires at the configured deadman_refresh_sec interval with a
+        safety margin against timing jitter from the 60s heartbeat."""
         for w in self._workers.values():
             if hasattr(w.executor, "should_refresh_deadman") and w.executor.should_refresh_deadman(now_ms):
                 w.executor.refresh_deadman(now_ms)
-        self._maybe_auto_train()
 
     def runtime_summary(self) -> dict[str, float | int]:
         return {

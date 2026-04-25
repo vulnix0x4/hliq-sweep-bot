@@ -123,6 +123,7 @@ def test_pending_entry_cancels_on_expiry():
     }
     fake_exchange.cancel_by_cloid.return_value = {"status": "ok"}
     mgr._exchange = fake_exchange
+    mgr._info = MagicMock()  # prevent real HTTP calls during _maybe_detect_fill
 
     sig = _signal()
     mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
@@ -151,6 +152,7 @@ def test_pending_entry_does_not_cancel_before_expiry():
         "response": {"data": {"statuses": [{"resting": {"oid": 12345}}]}},
     }
     mgr._exchange = fake_exchange
+    mgr._info = MagicMock()  # prevent real HTTP calls during _maybe_detect_fill
 
     sig = _signal()
     mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
@@ -170,6 +172,7 @@ def test_pending_entry_clears_state_even_when_cancel_fails():
     }
     fake_exchange.cancel_by_cloid.side_effect = ConnectionError("simulated network failure")
     mgr._exchange = fake_exchange
+    mgr._info = MagicMock()  # prevent real HTTP calls during _maybe_detect_fill
 
     sig = _signal()
     mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
