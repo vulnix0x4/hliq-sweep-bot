@@ -30,8 +30,15 @@ log = logging.getLogger(__name__)
 
 
 def _make_executor(config: AppConfig, coin: str):
-    """Pick paper or live executor based on cfg.mode."""
+    """Pick paper or live executor based on cfg.mode.
+
+    The live import is lazy so paper mode never loads the HL SDK.
+    """
     if config.mode == "live":
+        if not config.live.allow_live:
+            raise RuntimeError(
+                "BOT_MODE=live requires BOT_ALLOW_LIVE=true (safety guard)"
+            )
         from hliq_bot.execution.hyperliquid_order_manager import HyperliquidOrderManager
         return HyperliquidOrderManager(config.strategy, config.live, coin=coin)
     return PaperOrderManager(config.strategy)

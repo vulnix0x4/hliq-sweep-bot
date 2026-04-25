@@ -320,3 +320,15 @@ def test_bot_uses_hyperliquid_executor_when_mode_live(tmp_path):
     from hliq_bot.execution.hyperliquid_order_manager import HyperliquidOrderManager
     for w in bot._workers.values():
         assert isinstance(w.executor, HyperliquidOrderManager)
+
+
+def test_bot_refuses_live_mode_when_allow_live_false(tmp_path):
+    """BOT_MODE=live without BOT_ALLOW_LIVE=true must fail at boot, not in worker loop."""
+    import pytest
+    cfg = _app_config(tmp_path)
+    cfg.mode = "live"
+    cfg.live.allow_live = False  # explicit
+    cfg.live.agent_private_key = "0x" + "a" * 64
+    cfg.live.main_wallet_address = "0x" + "b" * 40
+    with pytest.raises(RuntimeError, match="BOT_ALLOW_LIVE"):
+        SweepBot(cfg)
