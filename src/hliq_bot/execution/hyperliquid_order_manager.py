@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from typing import Any
 
 from hyperliquid.utils import constants
@@ -268,7 +269,8 @@ class HyperliquidOrderManager:
             side = Side.LONG if szi > 0 else Side.SHORT
             # Conservative wide stop at -2% (LONG) or +2% (SHORT) to limit unmanaged drift
             wide_stop = entry_px * (0.98 if side == Side.LONG else 1.02)
-            # Disable TP1/TP2 by setting them to entry — they can never fire
+            # TPs set to entry: tp1 is gated by tp1_filled=True (never fires);
+            # tp2 fires on first tick at-or-above entry (LONG) -> closes at break-even.
             self.position = OpenPosition(
                 signal_id="reconciled",
                 side=side,
@@ -276,7 +278,7 @@ class HyperliquidOrderManager:
                 stop_price=wide_stop,
                 tp1_price=entry_px,
                 tp2_price=entry_px,
-                opened_ms=int(self._last_trade_ms or 0),
+                opened_ms=int(time.time() * 1000),  # use wall clock so time-based exits behave normally
                 qty_initial=abs(szi),
                 qty_remaining=abs(szi),
                 risk_dollars=abs(szi * entry_px) * 0.02,  # rough — 2% of notional
@@ -290,7 +292,34 @@ class HyperliquidOrderManager:
                 "(manual cleanup recommended via scripts/flatten_live.py)",
                 self.coin, self.live_cfg.network, side.value, abs(szi), entry_px, wide_stop,
             )
+            notional = abs(szi) * entry_px
+            if notional > self.live_cfg.max_notional_per_trade:
+                log.warning(
+                    "Reconciled %s position notional $%.2f EXCEEDS max_notional_per_trade=$%.2f — "
+                    "consider manual flatten via scripts/flatten_live.py",
+                    self.coin, notional, self.live_cfg.max_notional_per_trade,
+                )
             break  # one position per coin in HL perp model
+
+        # Also cancel any stale resting orders for this coin — they belong to the
+        # pre-restart bot's state which we've now lost. Operator can manually
+        # re-place via the next signal if intended.
+        try:
+            open_orders = info.open_orders(address)
+            coin_orders = [
+                {"coin": o.get("coin"), "oid": o.get("oid")}
+                for o in open_orders
+                if str(o.get("coin", "")).upper() == self.coin.upper() and o.get("oid")
+            ]
+            if coin_orders:
+                exchange = self._ensure_exchange()
+                exchange.bulk_cancel(coin_orders)
+                log.warning(
+                    "Reconcile cancelled %d stale resting orders for %s",
+                    len(coin_orders), self.coin,
+                )
+        except Exception as exc:
+            log.warning("HL open_orders / bulk_cancel failed during reconcile: %s", exc, exc_info=True)
 
     def _agent_address(self) -> str:
         if self._agent_addr is None:
