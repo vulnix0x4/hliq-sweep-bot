@@ -3,22 +3,18 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from hyperliquid.utils import constants
+
 from hliq_bot.config import LiveConfig, StrategyConfig
 from hliq_bot.models import (
-    ClosedTrade,
-    ExecEventType,
     ExecutionUpdate,
     OpenPosition,
     PendingEntry,
-    Side,
     SweepSignal,
     TradeEvent,
 )
 
 log = logging.getLogger(__name__)
-
-_TESTNET_URL = "https://api.hyperliquid-testnet.xyz"
-_MAINNET_URL = "https://api.hyperliquid.xyz"
 
 
 class HyperliquidOrderManager:
@@ -90,4 +86,4 @@ class HyperliquidOrderManager:
 
     @property
     def api_url(self) -> str:
-        return _MAINNET_URL if self.live_cfg.network == "mainnet" else _TESTNET_URL
+        return constants.MAINNET_API_URL if self.live_cfg.network == "mainnet" else constants.TESTNET_API_URL
