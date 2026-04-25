@@ -161,15 +161,29 @@ class HyperliquidOrderManager:
         if age_sec < self.pending_entry.expiry_sec:
             return []
         pe = self.pending_entry
-        if self._pending_oid is not None:
-            try:
-                self._ensure_exchange().cancel(self.coin, self._pending_oid)
-            except Exception as exc:
-                log.warning("HL cancel failed for oid=%s: %s", self._pending_oid, exc)
+        # NOTE: If this cancel fails AND the order subsequently fills, the resulting
+        # position will be detected by Phase B.3's user_state polling. Operators
+        # should monitor bot.log for "HL cancel_by_cloid failed" and run
+        # scripts/flatten_live.py if they see one until B.3 lands.
+        cancel_failed = False
+        cancel_err: str | None = None
+        try:
+            cloid = _cloid_from_signal_id(pe.signal_id)
+            self._ensure_exchange().cancel_by_cloid(self.coin, cloid)
+        except Exception as exc:
+            cancel_failed = True
+            cancel_err = f"{type(exc).__name__}: {exc}"
+            log.warning(
+                "HL cancel_by_cloid failed for signal_id=%s oid=%s: %s",
+                pe.signal_id, self._pending_oid, exc,
+                exc_info=True,
+            )
         msg = (
             f"hl pending entry expired after {pe.expiry_sec}s: "
-            f"{pe.side.value} @ {pe.entry_price:.2f} oid={self._pending_oid}"
+            f"{pe.side.value} @ {pe.entry_price:.2f} signal_id={pe.signal_id} oid={self._pending_oid}"
         )
+        if cancel_failed:
+            msg += f" CANCEL_FAILED ({cancel_err}) — verify on HL & flatten if needed"
         sid = pe.signal_id
         self.pending_entry = None
         self._pending_oid = None
