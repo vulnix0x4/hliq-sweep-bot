@@ -8,6 +8,7 @@ from hyperliquid.utils import constants
 
 from hliq_bot.config import LiveConfig, StrategyConfig
 from hliq_bot.models import (
+    ClosedTrade,
     ExecEventType,
     ExecutionUpdate,
     OpenPosition,
@@ -155,7 +156,7 @@ class HyperliquidOrderManager:
         updates.extend(self._maybe_detect_fill(trade.ts_ms))
         # Only expire if no fill happened (pending_entry still set).
         updates.extend(self._maybe_expire_pending(trade.ts_ms))
-        # Phase C will add position management here
+        updates.extend(self._maybe_manage_open_position(trade))
         return updates
 
     def _maybe_detect_fill(self, now_ms: int) -> list[ExecutionUpdate]:
@@ -277,6 +278,111 @@ class HyperliquidOrderManager:
                 signal_id=sid,
             )
         ]
+
+    def _maybe_manage_open_position(self, trade: TradeEvent) -> list[ExecutionUpdate]:
+        if self.position is None:
+            return []
+        p = self.position
+        self._update_excursions(trade.price)
+
+        if p.side == Side.LONG:
+            stop_hit = trade.price <= p.stop_price
+        else:
+            stop_hit = trade.price >= p.stop_price
+
+        if stop_hit:
+            return self._close_via_market(trade.ts_ms, "stop_loss")
+
+        # Phases C.2.1-C.2.4 will add TP1/TP2/trail/time exits here
+        return []
+
+    def _close_via_market(self, ts_ms: int, reason: str) -> list[ExecutionUpdate]:
+        p = self.position
+        if p is None:
+            return []
+        exchange = self._ensure_exchange()
+        try:
+            result = exchange.market_close(
+                coin=self.coin,
+                sz=p.qty_remaining,
+                slippage=0.005,  # 0.5% slippage tolerance
+            )
+        except Exception as exc:
+            log.error(
+                "HL market_close failed for %s qty=%s: %s",
+                self.coin, p.qty_remaining, exc, exc_info=True,
+            )
+            # Cannot proceed: leaving position in place. Operator must manually intervene.
+            return []
+
+        fill_px = p.entry_price  # fallback if HL response is malformed
+        if isinstance(result, dict) and result.get("status") == "ok":
+            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+            if statuses:
+                st = statuses[0]
+                if "filled" in st:
+                    fill_px = float(st["filled"].get("avgPx", p.entry_price))
+
+        pnl_gross = (
+            (fill_px - p.entry_price) * p.qty_remaining
+            if p.side == Side.LONG
+            else (p.entry_price - fill_px) * p.qty_remaining
+        )
+        pnl_gross += p.realized_pnl
+        # Fees: taker on the market_close
+        final_fee = (fill_px * p.qty_remaining) * self.cfg.taker_fee_pct
+        fees_paid = p.realized_fees + final_fee
+        pnl_net = pnl_gross - fees_paid
+        risk = max(p.risk_dollars, 1e-9)
+        closed = ClosedTrade(
+            signal_id=p.signal_id,
+            side=p.side,
+            entry_price=p.entry_price,
+            exit_price=fill_px,
+            qty=p.qty_initial,
+            pnl=pnl_net,
+            pnl_gross=pnl_gross,
+            fees_paid=fees_paid,
+            risk_dollars=risk,
+            r_multiple=pnl_net / risk,
+            opened_ms=p.opened_ms,
+            closed_ms=ts_ms,
+            exit_reason=reason,
+            coin=self.coin,
+            mfe_pnl=self._price_to_pnl(p.best_price),
+            mae_pnl=self._price_to_pnl(p.worst_price),
+        )
+        self.position = None
+        return [ExecutionUpdate(
+            ts_ms=ts_ms,
+            event_type=ExecEventType.POSITION_CLOSED,
+            message=f"hl position closed [{self.live_cfg.network}] ({reason}): pnl={pnl_net:.4f} fees={fees_paid:.4f}",
+            signal_id=p.signal_id,
+            closed_trade=closed,
+        )]
+
+    def _update_excursions(self, price: float) -> None:
+        p = self.position
+        if p is None:
+            return
+        if p.best_price <= 0:
+            p.best_price = p.entry_price
+        if p.worst_price <= 0:
+            p.worst_price = p.entry_price
+        if p.side == Side.LONG:
+            p.best_price = max(p.best_price, price)
+            p.worst_price = min(p.worst_price, price)
+        else:
+            p.best_price = min(p.best_price, price)
+            p.worst_price = max(p.worst_price, price)
+
+    def _price_to_pnl(self, price: float) -> float:
+        p = self.position
+        if p is None:
+            return 0.0
+        if p.side == Side.LONG:
+            return (price - p.entry_price) * p.qty_initial
+        return (p.entry_price - price) * p.qty_initial
 
     # ---- Guards ----
 
