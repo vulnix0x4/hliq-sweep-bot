@@ -122,6 +122,7 @@ class PendingEntry:
     risk_dollars: float
     coin: str = ""
     signal_id: str = ""
+    external_oid: int | None = None  # exchange's order id (for live cancel)
 
 
 @dataclass(slots=True)

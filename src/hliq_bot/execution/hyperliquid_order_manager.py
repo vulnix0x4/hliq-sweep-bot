@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any
 
@@ -17,6 +18,17 @@ from hliq_bot.models import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _cloid_from_signal_id(signal_id: str):
+    """Derive a deterministic Cloid from our internal signal_id.
+
+    Hashes the (non-hex) signal_id with sha256 and uses the first 16 bytes
+    as a 128-bit int — the format Cloid.from_int expects.
+    """
+    from hyperliquid.utils.types import Cloid
+    digest = hashlib.sha256(signal_id.encode("utf-8")).digest()
+    return Cloid.from_int(int.from_bytes(digest[:16], "big"))
 
 
 class HyperliquidOrderManager:
@@ -74,15 +86,26 @@ class HyperliquidOrderManager:
 
         exchange = self._ensure_exchange()
         is_buy = signal.side == Side.LONG
+        cloid = _cloid_from_signal_id(signal_id)
         # Alo = "Add Liquidity Only" = post-only. Refused if it would cross the spread.
-        result = exchange.order(
-            name=self.coin,
-            is_buy=is_buy,
-            sz=qty,
-            limit_px=signal.entry_price,
-            order_type={"limit": {"tif": "Alo"}},
-            reduce_only=False,
-        )
+        try:
+            result = exchange.order(
+                name=self.coin,
+                is_buy=is_buy,
+                sz=qty,
+                limit_px=signal.entry_price,
+                order_type={"limit": {"tif": "Alo"}},
+                reduce_only=False,
+                cloid=cloid,
+            )
+        except Exception as exc:
+            # Translate any SDK/network error to RuntimeError with context so the
+            # caller (and the journal) sees a structured failure rather than an
+            # uncaught exception that leaves pending_entry=None silently.
+            raise RuntimeError(
+                f"HL order submission failed for signal_id={signal_id} "
+                f"side={signal.side.value} qty={qty} px={signal.entry_price}: {exc}"
+            ) from exc
         if result.get("status") != "ok":
             raise RuntimeError(f"HL order failed: {result}")
 
@@ -111,14 +134,15 @@ class HyperliquidOrderManager:
             level_label=signal.level_label,
             risk_dollars=risk_dollars,
             coin=self.coin,
+            external_oid=oid,
         )
-        # Stash the HL order id on the pending entry's signal_id mapping.
+        # Backup convenience mirror; source of truth is pending_entry.external_oid.
         self._pending_oid = oid
 
         return ExecutionUpdate(
             ts_ms=signal.created_ms,
             event_type=ExecEventType.ENTRY_PLACED,
-            message=f"hl entry placed: {signal.side.value} qty={qty:.6f} @ {signal.entry_price:.2f} oid={oid}",
+            message=f"hl entry placed [{self.live_cfg.network}]: {signal.side.value} qty={qty:.6f} @ {signal.entry_price:.2f} oid={oid}",
             signal_id=signal_id,
         )
 
@@ -144,6 +168,13 @@ class HyperliquidOrderManager:
             wallet,
             self.api_url,
             account_address=self.live_cfg.main_wallet_address or None,
+        )
+        log.info(
+            "HL exchange initialized: network=%s api=%s agent=%s account=%s",
+            self.live_cfg.network,
+            self.api_url,
+            wallet.address,
+            self.live_cfg.main_wallet_address or "self",
         )
         return self._exchange
 
