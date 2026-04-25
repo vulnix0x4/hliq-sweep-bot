@@ -214,7 +214,11 @@ class HyperliquidOrderManager:
                 opened_ms=now_ms,
                 qty_initial=abs(szi),
                 qty_remaining=abs(szi),
-                risk_dollars=pe.risk_dollars,
+                # Mirrors PaperOrderManager safeguard: protect against R-multiple
+                # inflation when HL fills a different (larger) qty than what the
+                # original sizing assumed. Using max() ensures r_multiple stays
+                # honest even if pe.risk_dollars was computed on a smaller qty.
+                risk_dollars=max(pe.risk_dollars, abs(entry_px - pe.stop_price) * abs(szi)),
                 realized_fees=entry_fee,
                 coin=self.coin,
                 best_price=entry_px,

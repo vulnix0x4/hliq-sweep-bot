@@ -208,6 +208,20 @@ class LiveConfig:
     deadman_cancel_sec: int = 60  # auto-cancel-all if bot doesn't refresh
     deadman_refresh_sec: int = 30  # how often to push the cancel timer forward
 
+    def __post_init__(self) -> None:
+        if self.deadman_refresh_sec >= self.deadman_cancel_sec:
+            raise ValueError(
+                f"deadman_refresh_sec ({self.deadman_refresh_sec}) must be < "
+                f"deadman_cancel_sec ({self.deadman_cancel_sec}) — otherwise the "
+                f"refresh fires after HL has already cancelled orders"
+            )
+        # Require at least 2x margin to handle jitter / network RTT / event-loop delay.
+        if self.deadman_cancel_sec < 2 * self.deadman_refresh_sec:
+            raise ValueError(
+                f"deadman_cancel_sec ({self.deadman_cancel_sec}) must be >= "
+                f"2 * deadman_refresh_sec ({self.deadman_refresh_sec}) for safety margin"
+            )
+
 
 @dataclass(slots=True)
 class ReplayConfig:
