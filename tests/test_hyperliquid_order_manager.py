@@ -112,3 +112,44 @@ def test_submit_entry_raises_on_network_error():
         mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
     # Pending entry should NOT be set after a failed submission
     assert mgr.pending_entry is None
+
+
+def test_pending_entry_cancels_on_expiry(monkeypatch):
+    mgr = HyperliquidOrderManager(StrategyConfig(pending_entry_expiry_sec=120), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 12345}}]}},
+    }
+    fake_exchange.cancel.return_value = {"status": "ok"}
+    mgr._exchange = fake_exchange
+
+    sig = _signal()
+    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    assert mgr.pending_entry is not None
+
+    # Trade event well past expiry — should trigger cancel
+    expired_ms = sig.created_ms + (200 * 1000)
+    updates = mgr.on_trade(TradeEvent(ts_ms=expired_ms, price=100.5, size=1.0))
+
+    fake_exchange.cancel.assert_called_once_with("BTC", 12345)
+    assert mgr.pending_entry is None
+    assert any(u.event_type == ExecEventType.ORDER_CANCELED for u in updates)
+
+
+def test_pending_entry_does_not_cancel_before_expiry():
+    """Before expiry, on_trade should not cancel or modify pending entry."""
+    mgr = HyperliquidOrderManager(StrategyConfig(pending_entry_expiry_sec=120), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 12345}}]}},
+    }
+    mgr._exchange = fake_exchange
+
+    sig = _signal()
+    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    # Trade event 60s after — half the 120s expiry
+    updates = mgr.on_trade(TradeEvent(ts_ms=sig.created_ms + 60_000, price=100.5, size=1.0))
+    assert mgr.pending_entry is not None  # still pending
+    fake_exchange.cancel.assert_not_called()

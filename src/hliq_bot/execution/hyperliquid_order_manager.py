@@ -147,8 +147,40 @@ class HyperliquidOrderManager:
         )
 
     def on_trade(self, trade: TradeEvent) -> list[ExecutionUpdate]:
-        # Phase B will fill this in — for now no-op.
-        return []
+        self._last_trade_ms = trade.ts_ms
+        updates: list[ExecutionUpdate] = []
+        updates.extend(self._maybe_expire_pending(trade.ts_ms))
+        # Phase B.3 will add fill detection here
+        # Phase C will add position management here
+        return updates
+
+    def _maybe_expire_pending(self, now_ms: int) -> list[ExecutionUpdate]:
+        if self.pending_entry is None:
+            return []
+        age_sec = (now_ms - self.pending_entry.created_ms) / 1000.0
+        if age_sec < self.pending_entry.expiry_sec:
+            return []
+        pe = self.pending_entry
+        if self._pending_oid is not None:
+            try:
+                self._ensure_exchange().cancel(self.coin, self._pending_oid)
+            except Exception as exc:
+                log.warning("HL cancel failed for oid=%s: %s", self._pending_oid, exc)
+        msg = (
+            f"hl pending entry expired after {pe.expiry_sec}s: "
+            f"{pe.side.value} @ {pe.entry_price:.2f} oid={self._pending_oid}"
+        )
+        sid = pe.signal_id
+        self.pending_entry = None
+        self._pending_oid = None
+        return [
+            ExecutionUpdate(
+                ts_ms=now_ms,
+                event_type=ExecEventType.ORDER_CANCELED,
+                message=msg,
+                signal_id=sid,
+            )
+        ]
 
     # ---- Guards ----
 
