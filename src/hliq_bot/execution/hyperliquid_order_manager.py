@@ -235,6 +235,63 @@ class HyperliquidOrderManager:
         self._info = Info(self.api_url, skip_ws=True)
         return self._info
 
+    def reconcile_on_startup(self) -> None:
+        """If a position already exists on HL (e.g. after a crash), restore local state.
+
+        Does NOT recover stop/TP levels — those are lost. Best practice: manually
+        flatten any open positions before restarting the bot. This method exists
+        so the bot at least knows it has exposure (instead of placing duplicate entries).
+
+        Sets a conservative wide stop at +/-2% from entry to limit unmanaged drift.
+        Disables TP1/TP2 (sets them to entry_price so they can never fire).
+        """
+        if not self.live_cfg.allow_live:
+            return
+        info = self._ensure_info()
+        address = self.live_cfg.main_wallet_address or self._agent_address()
+        try:
+            state = info.user_state(address)
+        except Exception as exc:
+            log.warning("HL user_state poll failed during startup reconcile: %s", exc, exc_info=True)
+            return
+        for ap in state.get("assetPositions", []):
+            pos = ap.get("position", {})
+            if str(pos.get("coin", "")).upper() != self.coin.upper():
+                continue
+            szi_raw = pos.get("szi")
+            szi = float(szi_raw.get("base", 0)) if isinstance(szi_raw, dict) else float(szi_raw or 0)
+            if szi == 0:
+                continue
+            entry_px = float(pos.get("entryPx", 0))
+            if entry_px <= 0:
+                continue
+            side = Side.LONG if szi > 0 else Side.SHORT
+            # Conservative wide stop at -2% (LONG) or +2% (SHORT) to limit unmanaged drift
+            wide_stop = entry_px * (0.98 if side == Side.LONG else 1.02)
+            # Disable TP1/TP2 by setting them to entry — they can never fire
+            self.position = OpenPosition(
+                signal_id="reconciled",
+                side=side,
+                entry_price=entry_px,
+                stop_price=wide_stop,
+                tp1_price=entry_px,
+                tp2_price=entry_px,
+                opened_ms=int(self._last_trade_ms or 0),
+                qty_initial=abs(szi),
+                qty_remaining=abs(szi),
+                risk_dollars=abs(szi * entry_px) * 0.02,  # rough — 2% of notional
+                coin=self.coin,
+                tp1_filled=True,  # mark as filled to prevent retry
+                best_price=entry_px,
+                worst_price=entry_px,
+            )
+            log.warning(
+                "Reconciled existing %s position [%s]: %s qty=%.6f entry=%.2f stop=%.2f "
+                "(manual cleanup recommended via scripts/flatten_live.py)",
+                self.coin, self.live_cfg.network, side.value, abs(szi), entry_px, wide_stop,
+            )
+            break  # one position per coin in HL perp model
+
     def _agent_address(self) -> str:
         if self._agent_addr is None:
             import eth_account

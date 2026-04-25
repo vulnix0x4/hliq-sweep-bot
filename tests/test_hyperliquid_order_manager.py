@@ -713,3 +713,76 @@ def test_post_tp1_trail_uses_trail_factor():
     mgr.on_trade(TradeEvent(ts_ms=3000, price=103.0, size=1.0))
     assert mgr.position is not None
     assert abs(mgr.position.stop_price - 101.5) < 1e-9
+
+
+def test_reconciles_existing_long_position_on_startup():
+    """If HL has an existing LONG position, reconstruct OpenPosition with conservative wide stop."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_info = MagicMock()
+    fake_info.user_state.return_value = {
+        "assetPositions": [{
+            "position": {"coin": "BTC", "szi": "0.005", "entryPx": "100.0"},
+        }],
+    }
+    mgr._info = fake_info
+    mgr.reconcile_on_startup()
+    assert mgr.position is not None
+    assert mgr.position.qty_initial == 0.005
+    assert mgr.position.entry_price == 100.0
+    assert mgr.position.side == Side.LONG
+    # Wide conservative stop: -2% from entry for LONG
+    assert abs(mgr.position.stop_price - 98.0) < 0.01
+    # TP1/TP2 disabled (set to entry so they never fire)
+    assert mgr.position.tp1_price == 100.0
+    assert mgr.position.tp2_price == 100.0
+
+
+def test_reconciles_existing_short_position_on_startup():
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_info = MagicMock()
+    fake_info.user_state.return_value = {
+        "assetPositions": [{
+            "position": {"coin": "BTC", "szi": "-0.005", "entryPx": "100.0"},
+        }],
+    }
+    mgr._info = fake_info
+    mgr.reconcile_on_startup()
+    assert mgr.position is not None
+    assert mgr.position.side == Side.SHORT
+    assert mgr.position.qty_initial == 0.005
+    # Wide conservative stop: +2% from entry for SHORT
+    assert abs(mgr.position.stop_price - 102.0) < 0.01
+
+
+def test_reconcile_no_op_when_no_position():
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_info = MagicMock()
+    fake_info.user_state.return_value = {"assetPositions": []}
+    mgr._info = fake_info
+    mgr.reconcile_on_startup()
+    assert mgr.position is None
+
+
+def test_reconcile_skipped_when_allow_live_false():
+    """Paper-mode default: reconcile_on_startup must do NOTHING."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), LiveConfig(allow_live=False), coin="BTC")
+    fake_info = MagicMock()
+    mgr._info = fake_info
+    mgr.reconcile_on_startup()
+    fake_info.user_state.assert_not_called()
+    assert mgr.position is None
+
+
+def test_reconcile_filters_other_coins():
+    """Only matching coin triggers reconciliation."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_info = MagicMock()
+    fake_info.user_state.return_value = {
+        "assetPositions": [
+            {"position": {"coin": "ETH", "szi": "1.0", "entryPx": "2000.0"}},
+            {"position": {"coin": "SOL", "szi": "10.0", "entryPx": "100.0"}},
+        ],
+    }
+    mgr._info = fake_info
+    mgr.reconcile_on_startup()
+    assert mgr.position is None

@@ -122,6 +122,14 @@ class SweepBot:
         self._session_tracker = _first.session_tracker
         self._vwap_tracker = _first.vwap_tracker
 
+        # Reconcile any existing live positions on startup (idempotent for paper).
+        for w in self._workers.values():
+            if hasattr(w.executor, "reconcile_on_startup"):
+                try:
+                    w.executor.reconcile_on_startup()
+                except Exception as exc:
+                    log.warning("reconcile_on_startup failed for %s: %s", w.coin, exc, exc_info=True)
+
         self._resolved_trades = self._restore_risk_from_journal()
 
         self._last_event_ms = 0
