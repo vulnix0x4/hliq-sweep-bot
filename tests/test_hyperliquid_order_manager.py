@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from hliq_bot.config import LiveConfig, StrategyConfig
 from hliq_bot.execution.hyperliquid_order_manager import HyperliquidOrderManager
-from hliq_bot.models import Side, SweepSignal, TradeEvent
+from hliq_bot.models import ExecEventType, Side, SweepSignal, TradeEvent
 
 
 def _signal() -> SweepSignal:
@@ -52,3 +54,43 @@ def test_refuses_when_notional_exceeds_cap():
     sig = _signal()  # qty=1.0, entry=100.0 -> notional=$100
     with pytest.raises(RuntimeError, match="max_notional"):
         mgr.submit_entry(sig, signal_id="abc", qty=1.0, risk_dollars=1.0)
+
+
+def _live_cfg():
+    return LiveConfig(
+        allow_live=True,
+        agent_private_key="0x" + "a" * 64,
+        main_wallet_address="0x" + "b" * 40,
+        max_notional_per_trade=10000.0,
+    )
+
+
+def test_submit_entry_places_post_only_limit(monkeypatch):
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 12345}}]}},
+    }
+    mgr._exchange = fake_exchange  # inject mock
+
+    sig = _signal()
+    update = mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+
+    assert update.event_type == ExecEventType.ENTRY_PLACED
+    assert update.signal_id == "abc"
+    fake_exchange.order.assert_called_once()
+    args, kwargs = fake_exchange.order.call_args
+    # Verify the kwargs are correct
+    assert (kwargs.get("name") == "BTC") or (len(args) > 0 and args[0] == "BTC")
+    # is_buy must reflect side
+    is_buy = kwargs.get("is_buy") if "is_buy" in kwargs else (args[1] if len(args) > 1 else None)
+    assert is_buy is True
+    # Post-only via Alo
+    order_type = kwargs.get("order_type")
+    if order_type is None and len(args) >= 5:
+        order_type = args[4]
+    assert order_type == {"limit": {"tif": "Alo"}}
+    # Pending entry was recorded
+    assert mgr.pending_entry is not None
+    assert mgr.pending_entry.qty == 0.001
