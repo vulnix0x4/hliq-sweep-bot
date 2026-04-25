@@ -479,3 +479,81 @@ def test_market_close_avg_px_fallback_uses_trade_price():
     assert closed.exit_price == 98.5
     # pnl_gross should reflect the actual loss: (98.5 - 100.0) * 0.001 = -0.0015
     assert abs(closed.pnl_gross - (-0.0015)) < 1e-9
+
+
+def test_tp1_partial_close_at_target():
+    """When price hits tp1, partial-close 50% via market_close + move stop to BE."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.0005", "avgPx": "102.0"}}]}},
+    }
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=99.0, tp1_price=102.0, tp2_price=104.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        risk_dollars=1.0, coin="BTC", best_price=100.0, worst_price=100.0,
+    )
+    updates = mgr.on_trade(TradeEvent(ts_ms=2000, price=102.5, size=1.0))
+    # market_close called with HALF qty
+    fake_exchange.market_close.assert_called_once()
+    call_kwargs = fake_exchange.market_close.call_args.kwargs
+    assert abs(call_kwargs.get("sz", 0) - 0.0005) < 1e-9
+    # Position still open (other half), tp1_filled=True, stop at BE
+    assert mgr.position is not None
+    assert mgr.position.tp1_filled is True
+    assert mgr.position.stop_price == 100.0  # entry / BE
+    assert abs(mgr.position.qty_remaining - 0.0005) < 1e-9
+    # PARTIAL_TP event emitted
+    assert any(u.event_type == ExecEventType.PARTIAL_TP for u in updates)
+
+
+def test_tp1_does_not_fire_twice():
+    """Once tp1_filled=True, subsequent ticks at tp1 must NOT fire again."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.0005", "avgPx": "102.0"}}]}},
+    }
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=99.0, tp1_price=102.0, tp2_price=104.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        risk_dollars=1.0, coin="BTC", best_price=100.0, worst_price=100.0,
+        tp1_filled=False,
+    )
+    mgr.on_trade(TradeEvent(ts_ms=2000, price=102.5, size=1.0))
+    assert mgr.position.tp1_filled is True
+    # Second tick at tp1 should NOT call market_close again
+    fake_exchange.market_close.reset_mock()
+    mgr.on_trade(TradeEvent(ts_ms=3000, price=102.7, size=1.0))
+    fake_exchange.market_close.assert_not_called()
+
+
+def test_short_tp1_fires_when_price_below_target():
+    """SHORT tp1 should fire when price falls to tp1 (which is below entry)."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.0005", "avgPx": "98.0"}}]}},
+    }
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.SHORT, entry_price=100.0,
+        stop_price=101.0, tp1_price=98.0, tp2_price=96.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        risk_dollars=1.0, coin="BTC", best_price=100.0, worst_price=100.0,
+    )
+    updates = mgr.on_trade(TradeEvent(ts_ms=2000, price=97.5, size=1.0))
+    fake_exchange.market_close.assert_called_once()
+    assert mgr.position.tp1_filled is True
+    assert mgr.position.stop_price == 100.0
+    assert any(u.event_type == ExecEventType.PARTIAL_TP for u in updates)
