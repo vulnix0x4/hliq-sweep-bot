@@ -342,3 +342,70 @@ def test_fill_polling_rate_limited_to_1_per_second():
     # Tick at +1100ms (> 1s after first poll) -> second poll allowed
     mgr.on_trade(TradeEvent(ts_ms=base + 1100, price=100.0, size=1.0))
     assert fake_info.user_state.call_count == 2
+
+
+def test_stop_loss_triggers_market_close():
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.001", "avgPx": "99.0"}}]}},
+    }
+    mgr._exchange = fake_exchange
+    # Pre-seed an open long position
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=99.0, tp1_price=102.0, tp2_price=104.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        risk_dollars=0.001, coin="BTC", best_price=100.0, worst_price=100.0,
+    )
+
+    # Price hits stop
+    updates = mgr.on_trade(TradeEvent(ts_ms=2000, price=98.5, size=1.0))
+    fake_exchange.market_close.assert_called_once()
+    assert mgr.position is None
+    assert any(u.event_type == ExecEventType.POSITION_CLOSED for u in updates)
+    closed = [u for u in updates if u.closed_trade is not None][0].closed_trade
+    assert closed.exit_reason == "stop_loss"
+    assert closed.pnl_gross < 0
+
+
+def test_no_close_when_price_above_stop():
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=99.0, tp1_price=102.0, tp2_price=104.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        risk_dollars=0.001, coin="BTC", best_price=100.0, worst_price=100.0,
+    )
+    # Price above stop -> no close
+    updates = mgr.on_trade(TradeEvent(ts_ms=2000, price=99.5, size=1.0))
+    fake_exchange.market_close.assert_not_called()
+    assert mgr.position is not None
+
+
+def test_short_stop_loss_triggers_when_price_above_stop():
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.001", "avgPx": "101.0"}}]}},
+    }
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.SHORT, entry_price=100.0,
+        stop_price=101.0, tp1_price=98.0, tp2_price=96.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        risk_dollars=0.001, coin="BTC", best_price=100.0, worst_price=100.0,
+    )
+    # SHORT stop is ABOVE entry — price rising hits stop
+    updates = mgr.on_trade(TradeEvent(ts_ms=2000, price=101.5, size=1.0))
+    fake_exchange.market_close.assert_called_once()
+    assert mgr.position is None
+    closed = [u for u in updates if u.closed_trade is not None][0].closed_trade
+    assert closed.exit_reason == "stop_loss"
