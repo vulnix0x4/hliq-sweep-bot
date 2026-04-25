@@ -150,9 +150,72 @@ class HyperliquidOrderManager:
         self._last_trade_ms = trade.ts_ms
         updates: list[ExecutionUpdate] = []
         updates.extend(self._maybe_expire_pending(trade.ts_ms))
-        # Phase B.3 will add fill detection here
+        updates.extend(self._maybe_detect_fill(trade.ts_ms))
         # Phase C will add position management here
         return updates
+
+    def _maybe_detect_fill(self, now_ms: int) -> list[ExecutionUpdate]:
+        """Poll info.user_state to see if our pending entry has been filled."""
+        if self.pending_entry is None or self.position is not None:
+            return []
+        info = self._ensure_info()
+        address = self.live_cfg.main_wallet_address or self._agent_address()
+        try:
+            state = info.user_state(address)
+        except Exception as exc:
+            log.warning("HL user_state poll failed: %s", exc, exc_info=True)
+            return []
+        target_qty = self.pending_entry.qty
+        for ap in state.get("assetPositions", []):
+            pos = ap.get("position", {})
+            if str(pos.get("coin", "")).upper() != self.coin.upper():
+                continue
+            szi_raw = pos.get("szi")
+            # szi may be a string (signed) or a dict {"base": "...", ...}
+            if isinstance(szi_raw, dict):
+                szi = float(szi_raw.get("base", 0))
+            else:
+                szi = float(szi_raw or 0)
+            # Only consider this a fill if at least 50% of target qty is on the book
+            if abs(szi) < target_qty * 0.5:
+                continue
+            entry_px = float(pos.get("entryPx", self.pending_entry.entry_price))
+            pe = self.pending_entry
+            self.position = OpenPosition(
+                signal_id=pe.signal_id,
+                side=pe.side,
+                entry_price=entry_px,
+                stop_price=pe.stop_price,
+                tp1_price=pe.tp1_price,
+                tp2_price=pe.tp2_price,
+                opened_ms=now_ms,
+                qty_initial=abs(szi),
+                qty_remaining=abs(szi),
+                risk_dollars=pe.risk_dollars,
+                coin=self.coin,
+                best_price=entry_px,
+                worst_price=entry_px,
+            )
+            self.pending_entry = None
+            self._pending_oid = None
+            return [ExecutionUpdate(
+                ts_ms=now_ms,
+                event_type=ExecEventType.ENTRY_FILLED,
+                message=f"hl entry filled: {pe.side.value} qty={szi:.6f} @ {entry_px:.2f}",
+                signal_id=pe.signal_id,
+            )]
+        return []
+
+    def _ensure_info(self):
+        if self._info is not None:
+            return self._info
+        from hyperliquid.info import Info
+        self._info = Info(self.api_url, skip_ws=True)
+        return self._info
+
+    def _agent_address(self) -> str:
+        import eth_account
+        return eth_account.Account.from_key(self.live_cfg.agent_private_key).address
 
     def _maybe_expire_pending(self, now_ms: int) -> list[ExecutionUpdate]:
         if self.pending_entry is None:
