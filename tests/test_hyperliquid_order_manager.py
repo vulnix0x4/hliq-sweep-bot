@@ -724,6 +724,7 @@ def test_reconciles_existing_long_position_on_startup():
             "position": {"coin": "BTC", "szi": "0.005", "entryPx": "100.0"},
         }],
     }
+    fake_info.open_orders.return_value = []
     mgr._info = fake_info
     mgr.reconcile_on_startup()
     assert mgr.position is not None
@@ -745,6 +746,7 @@ def test_reconciles_existing_short_position_on_startup():
             "position": {"coin": "BTC", "szi": "-0.005", "entryPx": "100.0"},
         }],
     }
+    fake_info.open_orders.return_value = []
     mgr._info = fake_info
     mgr.reconcile_on_startup()
     assert mgr.position is not None
@@ -758,6 +760,7 @@ def test_reconcile_no_op_when_no_position():
     mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
     fake_info = MagicMock()
     fake_info.user_state.return_value = {"assetPositions": []}
+    fake_info.open_orders.return_value = []
     mgr._info = fake_info
     mgr.reconcile_on_startup()
     assert mgr.position is None
@@ -783,6 +786,48 @@ def test_reconcile_filters_other_coins():
             {"position": {"coin": "SOL", "szi": "10.0", "entryPx": "100.0"}},
         ],
     }
+    fake_info.open_orders.return_value = []
     mgr._info = fake_info
     mgr.reconcile_on_startup()
     assert mgr.position is None
+
+
+def test_reconcile_uses_wall_clock_for_opened_ms(monkeypatch):
+    """opened_ms must use wall clock, not _last_trade_ms (which is 0 at startup).
+    Otherwise the first trade tick would trigger max_hold/time_stop immediately."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_info = MagicMock()
+    fake_info.user_state.return_value = {
+        "assetPositions": [{"position": {"coin": "BTC", "szi": "0.001", "entryPx": "100.0"}}],
+    }
+    fake_info.open_orders.return_value = []
+    mgr._info = fake_info
+
+    # Mock time.time() to a known value
+    import hliq_bot.execution.hyperliquid_order_manager as adapter_mod
+    monkeypatch.setattr(adapter_mod.time, "time", lambda: 1_700_000_000.0)
+    mgr.reconcile_on_startup()
+    assert mgr.position is not None
+    assert mgr.position.opened_ms == 1_700_000_000_000  # ms
+
+
+def test_reconcile_cancels_stale_resting_orders():
+    """Any resting orders for our coin at restart must be cancelled to prevent
+    double-entry on the next signal."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.bulk_cancel.return_value = {"status": "ok"}
+    fake_info = MagicMock()
+    fake_info.user_state.return_value = {"assetPositions": []}
+    fake_info.open_orders.return_value = [
+        {"coin": "BTC", "oid": 12345},
+        {"coin": "BTC", "oid": 12346},
+        {"coin": "ETH", "oid": 99999},  # other coin -- ignored
+    ]
+    mgr._exchange = fake_exchange
+    mgr._info = fake_info
+    mgr.reconcile_on_startup()
+    fake_exchange.bulk_cancel.assert_called_once()
+    cancelled = fake_exchange.bulk_cancel.call_args.args[0]
+    assert len(cancelled) == 2
+    assert all(o["coin"] == "BTC" for o in cancelled)
