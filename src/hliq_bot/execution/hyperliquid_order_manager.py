@@ -291,14 +291,75 @@ class HyperliquidOrderManager:
 
         if p.side == Side.LONG:
             stop_hit = trade.price <= p.stop_price
+            tp1_hit = (not p.tp1_filled) and trade.price >= p.tp1_price
         else:
             stop_hit = trade.price >= p.stop_price
+            tp1_hit = (not p.tp1_filled) and trade.price <= p.tp1_price
 
         if stop_hit:
             return self._close_via_market(trade.ts_ms, "stop_loss", trade.price)
 
-        # Phases C.2.1-C.2.4 will add TP1/TP2/trail/time exits here
-        return []
+        out: list[ExecutionUpdate] = []
+        if tp1_hit:
+            out.extend(self._partial_close_tp1(trade.ts_ms, trade.price))
+
+        # Phases C.2.2-C.2.4 will add TP2/trail/time exits here
+
+        return out
+
+    def _partial_close_tp1(self, ts_ms: int, trade_price: float) -> list[ExecutionUpdate]:
+        """Partial-close 50% of remaining qty at TP1 via market_close (taker fee)."""
+        p = self.position
+        if p is None or p.tp1_filled:
+            return []
+        partial_qty = p.qty_remaining * 0.5
+        exchange = self._ensure_exchange()
+        try:
+            result = exchange.market_close(
+                coin=self.coin,
+                sz=partial_qty,
+                slippage=0.005,
+            )
+        except Exception as exc:
+            log.error(
+                "HL TP1 partial market_close failed for %s qty=%s: %s",
+                self.coin, partial_qty, exc, exc_info=True,
+            )
+            return []
+
+        if result is None:
+            log.warning(
+                "HL TP1 partial market_close returned None for %s — HL has no matching position",
+                self.coin,
+            )
+            return []
+
+        fill_px = trade_price
+        if isinstance(result, dict) and result.get("status") == "ok":
+            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+            if statuses:
+                st = statuses[0]
+                if "filled" in st:
+                    fill_px = float(st["filled"].get("avgPx", trade_price))
+
+        # Realize the partial PnL + taker fee on the closed half
+        if p.side == Side.LONG:
+            partial_pnl = (fill_px - p.entry_price) * partial_qty
+        else:
+            partial_pnl = (p.entry_price - fill_px) * partial_qty
+        partial_fee = (fill_px * partial_qty) * self.cfg.taker_fee_pct
+        p.realized_pnl += partial_pnl
+        p.realized_fees += partial_fee
+        p.qty_remaining -= partial_qty
+        p.tp1_filled = True
+        # Reduce tail risk after first scale (move stop to BE).
+        p.stop_price = p.entry_price
+        return [ExecutionUpdate(
+            ts_ms=ts_ms,
+            event_type=ExecEventType.PARTIAL_TP,
+            message=f"hl tp1 partial [{self.live_cfg.network}]: qty={partial_qty:.6f} @ {fill_px:.2f} (stop->BE)",
+            signal_id=p.signal_id,
+        )]
 
     def _close_via_market(self, ts_ms: int, reason: str, trade_price: float) -> list[ExecutionUpdate]:
         p = self.position
