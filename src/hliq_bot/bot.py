@@ -1410,6 +1410,11 @@ class SweepBot:
             if diag:
                 summary = ", ".join(f"{k}={v}" for k, v in diag)
                 log.info("Detector diagnostics [%s]: %s", w.coin, summary)
+        # Deadman switch: push HL's schedule_cancel timer forward each heartbeat
+        # so HL auto-cancels our resting orders if the bot dies.
+        for w in self._workers.values():
+            if hasattr(w.executor, "should_refresh_deadman") and w.executor.should_refresh_deadman(now_ms):
+                w.executor.refresh_deadman(now_ms)
         self._maybe_auto_train()
 
     def runtime_summary(self) -> dict[str, float | int]:
