@@ -91,6 +91,24 @@ def test_submit_entry_places_post_only_limit(monkeypatch):
     if order_type is None and len(args) >= 5:
         order_type = args[4]
     assert order_type == {"limit": {"tif": "Alo"}}
+    assert kwargs.get("limit_px") == 100.0
+    assert kwargs.get("sz") == 0.001
+    assert kwargs.get("reduce_only") is False
     # Pending entry was recorded
     assert mgr.pending_entry is not None
     assert mgr.pending_entry.qty == 0.001
+    # pending_entry now also has external_oid
+    assert mgr.pending_entry.external_oid == 12345
+
+
+def test_submit_entry_raises_on_network_error():
+    """Network/SDK exceptions must be translated to RuntimeError."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.order.side_effect = ConnectionError("simulated network failure")
+    mgr._exchange = fake_exchange
+    sig = _signal()
+    with pytest.raises(RuntimeError, match="HL order"):
+        mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    # Pending entry should NOT be set after a failed submission
+    assert mgr.pending_entry is None
