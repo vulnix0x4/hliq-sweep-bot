@@ -831,3 +831,79 @@ def test_reconcile_cancels_stale_resting_orders():
     cancelled = fake_exchange.bulk_cancel.call_args.args[0]
     assert len(cancelled) == 2
     assert all(o["coin"] == "BTC" for o in cancelled)
+
+
+def test_deadman_refresh_pushes_cancel_timer():
+    """refresh_deadman calls schedule_cancel(now + deadman_cancel_sec*1000)."""
+    cfg = LiveConfig(
+        allow_live=True,
+        agent_private_key="0x" + "a" * 64,
+        main_wallet_address="0x" + "b" * 40,
+        max_notional_per_trade=10000.0,
+        deadman_cancel_sec=60,
+        deadman_refresh_sec=30,
+    )
+    mgr = HyperliquidOrderManager(StrategyConfig(), cfg, coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.schedule_cancel.return_value = {"status": "ok"}
+    mgr._exchange = fake_exchange
+
+    mgr.refresh_deadman(now_ms=1_000_000_000_000)
+    fake_exchange.schedule_cancel.assert_called_once()
+    arg = fake_exchange.schedule_cancel.call_args.args[0]
+    assert arg == 1_000_000_000_000 + 60_000
+
+
+def test_deadman_refresh_paper_no_op():
+    """In paper mode (allow_live=False), refresh_deadman must not touch the SDK."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), LiveConfig(allow_live=False), coin="BTC")
+    fake_exchange = MagicMock()
+    mgr._exchange = fake_exchange
+    mgr.refresh_deadman(now_ms=1_000_000_000_000)
+    fake_exchange.schedule_cancel.assert_not_called()
+
+
+def test_should_refresh_deadman_returns_false_before_interval():
+    """should_refresh_deadman returns True only after deadman_refresh_sec elapsed."""
+    cfg = LiveConfig(
+        allow_live=True,
+        agent_private_key="0x" + "a" * 64,
+        main_wallet_address="0x" + "b" * 40,
+        max_notional_per_trade=10000.0,
+        deadman_refresh_sec=30,
+    )
+    mgr = HyperliquidOrderManager(StrategyConfig(), cfg, coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.schedule_cancel.return_value = {"status": "ok"}
+    mgr._exchange = fake_exchange
+
+    # First call: never refreshed yet, should return True
+    assert mgr.should_refresh_deadman(now_ms=1_000_000_000_000) is True
+    # Refresh
+    mgr.refresh_deadman(now_ms=1_000_000_000_000)
+    # 10s later: too soon
+    assert mgr.should_refresh_deadman(now_ms=1_000_000_000_000 + 10_000) is False
+    # 31s later: due
+    assert mgr.should_refresh_deadman(now_ms=1_000_000_000_000 + 31_000) is True
+
+
+def test_should_refresh_deadman_paper_returns_false():
+    mgr = HyperliquidOrderManager(StrategyConfig(), LiveConfig(allow_live=False), coin="BTC")
+    assert mgr.should_refresh_deadman(now_ms=1_000_000_000_000) is False
+
+
+def test_refresh_deadman_swallows_sdk_failure():
+    """If schedule_cancel raises, refresh_deadman logs but doesn't propagate.
+    The next refresh attempt will retry."""
+    cfg = LiveConfig(
+        allow_live=True,
+        agent_private_key="0x" + "a" * 64,
+        main_wallet_address="0x" + "b" * 40,
+        max_notional_per_trade=10000.0,
+    )
+    mgr = HyperliquidOrderManager(StrategyConfig(), cfg, coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.schedule_cancel.side_effect = ConnectionError("network failure")
+    mgr._exchange = fake_exchange
+    # Should not raise
+    mgr.refresh_deadman(now_ms=1_000_000_000_000)

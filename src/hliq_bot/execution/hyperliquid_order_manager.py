@@ -64,6 +64,7 @@ class HyperliquidOrderManager:
         self._pending_oid: int | None = None
         self._last_fill_poll_ms: int = 0
         self._agent_addr: str | None = None
+        self._last_deadman_refresh_ms: int = 0
         # SDK clients — constructed on first network operation.
         self._exchange: Any = None
         self._info: Any = None
@@ -326,6 +327,25 @@ class HyperliquidOrderManager:
             import eth_account
             self._agent_addr = eth_account.Account.from_key(self.live_cfg.agent_private_key).address
         return self._agent_addr
+
+    def refresh_deadman(self, now_ms: int) -> None:
+        """Push the schedule_cancel timer forward. Must be called periodically;
+        if not called within deadman_cancel_sec, HL auto-cancels all orders."""
+        if not self.live_cfg.allow_live:
+            return
+        cancel_at = now_ms + self.live_cfg.deadman_cancel_sec * 1000
+        try:
+            self._ensure_exchange().schedule_cancel(cancel_at)
+            self._last_deadman_refresh_ms = now_ms
+        except Exception as exc:
+            log.warning("Deadman refresh failed: %s", exc, exc_info=True)
+
+    def should_refresh_deadman(self, now_ms: int) -> bool:
+        """True if deadman_refresh_sec has elapsed since the last refresh (or never)."""
+        if not self.live_cfg.allow_live:
+            return False
+        elapsed_ms = now_ms - self._last_deadman_refresh_ms
+        return elapsed_ms >= self.live_cfg.deadman_refresh_sec * 1000
 
     def _maybe_expire_pending(self, now_ms: int) -> list[ExecutionUpdate]:
         if self.pending_entry is None:
