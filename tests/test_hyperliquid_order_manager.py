@@ -409,3 +409,73 @@ def test_short_stop_loss_triggers_when_price_above_stop():
     assert mgr.position is None
     closed = [u for u in updates if u.closed_trade is not None][0].closed_trade
     assert closed.exit_reason == "stop_loss"
+
+
+def test_entry_fee_recorded_on_live_fill():
+    """Live fills must record the maker entry fee (rebate) just like paper does."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 12345}}]}},
+    }
+    fake_info = MagicMock()
+    fake_info.user_state.return_value = {
+        "assetPositions": [{"position": {"coin": "BTC", "szi": "0.001", "entryPx": "100.0"}}],
+    }
+    mgr._exchange = fake_exchange
+    mgr._info = fake_info
+    sig = _signal()
+    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    mgr.on_trade(TradeEvent(ts_ms=sig.created_ms + 1500, price=100.0, size=1.0))
+    # entry_fee should be entry_px * qty * maker_fee_pct = 100.0 * 0.001 * -0.00015 = -1.5e-5
+    expected = 100.0 * 0.001 * StrategyConfig().maker_fee_pct
+    assert abs(mgr.position.realized_fees - expected) < 1e-12
+
+
+def test_market_close_none_result_clears_state_with_phantom_close():
+    """If HL has no matching position (returns None), clear local state cleanly."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.market_close.return_value = None  # SDK returns None for no-position
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=99.0, tp1_price=102.0, tp2_price=104.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        risk_dollars=1.0, coin="BTC", best_price=100.0, worst_price=100.0,
+    )
+    updates = mgr.on_trade(TradeEvent(ts_ms=2000, price=98.5, size=1.0))
+    # Position cleared, ExecutionUpdate emitted, but closed_trade is None (phantom)
+    assert mgr.position is None
+    closed_events = [u for u in updates if u.event_type == ExecEventType.POSITION_CLOSED]
+    assert len(closed_events) == 1
+    assert closed_events[0].closed_trade is None
+    assert "phantom_close" in closed_events[0].message
+
+
+def test_market_close_avg_px_fallback_uses_trade_price():
+    """If HL response is malformed, fall back to the trigger trade.price (not entry_price).
+    This avoids understating the loss on a stop-out from a fast move."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{}]}},  # malformed — no "filled"
+    }
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=99.0, tp1_price=102.0, tp2_price=104.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        risk_dollars=1.0, coin="BTC", best_price=100.0, worst_price=100.0,
+    )
+    # Stop triggered at 98.5 (worse than stop_price=99.0)
+    updates = mgr.on_trade(TradeEvent(ts_ms=2000, price=98.5, size=1.0))
+    closed = [u for u in updates if u.closed_trade is not None][0].closed_trade
+    # Should record exit_price=98.5 (trade.price), not 100.0 (entry_price)
+    assert closed.exit_price == 98.5
+    # pnl_gross should reflect the actual loss: (98.5 - 100.0) * 0.001 = -0.0015
+    assert abs(closed.pnl_gross - (-0.0015)) < 1e-9
