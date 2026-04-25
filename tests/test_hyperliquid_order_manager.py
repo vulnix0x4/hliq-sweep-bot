@@ -502,10 +502,13 @@ def test_tp1_partial_close_at_target():
     fake_exchange.market_close.assert_called_once()
     call_kwargs = fake_exchange.market_close.call_args.kwargs
     assert abs(call_kwargs.get("sz", 0) - 0.0005) < 1e-9
-    # Position still open (other half), tp1_filled=True, stop at BE
+    # Position still open (other half), tp1_filled=True
+    # Stop moved to BE then immediately trailed post-TP1 (trail_factor=0.5):
+    # new_stop = entry + (best - entry) * 0.5 = 100 + (102.5 - 100) * 0.5 = 101.25
     assert mgr.position is not None
     assert mgr.position.tp1_filled is True
-    assert mgr.position.stop_price == 100.0  # entry / BE
+    assert mgr.position.stop_price >= 100.0  # at least BE
+    assert abs(mgr.position.stop_price - 101.25) < 1e-9
     assert abs(mgr.position.qty_remaining - 0.0005) < 1e-9
     # PARTIAL_TP event emitted
     assert any(u.event_type == ExecEventType.PARTIAL_TP for u in updates)
@@ -555,5 +558,158 @@ def test_short_tp1_fires_when_price_below_target():
     updates = mgr.on_trade(TradeEvent(ts_ms=2000, price=97.5, size=1.0))
     fake_exchange.market_close.assert_called_once()
     assert mgr.position.tp1_filled is True
-    assert mgr.position.stop_price == 100.0
+    # Stop moved to BE then immediately trailed post-TP1 (SHORT trail_factor=0.5):
+    # new_stop = entry - (entry - best) * 0.5 = 100 - (100 - 97.5) * 0.5 = 98.75
+    assert mgr.position.stop_price <= 100.0  # at most BE
+    assert abs(mgr.position.stop_price - 98.75) < 1e-9
     assert any(u.event_type == ExecEventType.PARTIAL_TP for u in updates)
+
+
+def test_tp2_triggers_full_close():
+    """When price hits tp2 and qty remains, close all via market_close."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.001", "avgPx": "104.0"}}]}},
+    }
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=99.0, tp1_price=102.0, tp2_price=104.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        risk_dollars=1.0, coin="BTC", best_price=100.0, worst_price=100.0,
+    )
+    updates = mgr.on_trade(TradeEvent(ts_ms=2000, price=104.5, size=1.0))
+    fake_exchange.market_close.assert_called()
+    assert mgr.position is None
+    closed = [u for u in updates if u.closed_trade is not None][0].closed_trade
+    assert closed.exit_reason == "tp2"
+    assert closed.pnl_gross > 0
+
+
+def test_max_hold_triggers_after_max_holding_sec():
+    cfg = StrategyConfig(max_holding_sec=100)
+    mgr = HyperliquidOrderManager(cfg, _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.001", "avgPx": "100.5"}}]}},
+    }
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=99.0, tp1_price=102.0, tp2_price=104.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        risk_dollars=1.0, coin="BTC", best_price=100.0, worst_price=100.0,
+    )
+    # 101 sec elapsed -> max_hold triggers
+    updates = mgr.on_trade(TradeEvent(ts_ms=1000 + 101 * 1000, price=100.5, size=1.0))
+    fake_exchange.market_close.assert_called()
+    closed = [u for u in updates if u.closed_trade is not None][0].closed_trade
+    assert closed.exit_reason == "max_hold"
+
+
+def test_early_exit_triggers_when_deeply_negative():
+    cfg = StrategyConfig(
+        early_exit_sec=120,
+        early_exit_r_threshold=-0.5,
+        max_holding_sec=1800,
+        time_stop_sec=600,
+    )
+    mgr = HyperliquidOrderManager(cfg, _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.001", "avgPx": "99.5"}}]}},
+    }
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=98.0, tp1_price=102.0, tp2_price=104.0,
+        opened_ms=1000, qty_initial=1.0, qty_remaining=1.0,
+        risk_dollars=2.0, coin="BTC", best_price=100.0, worst_price=98.5,
+    )
+    # 130 sec elapsed, price=98.8 -> r_unrealized = (98.8-100)*1.0 / 2.0 = -0.6 (< -0.5)
+    updates = mgr.on_trade(TradeEvent(ts_ms=1000 + 130 * 1000, price=98.8, size=1.0))
+    fake_exchange.market_close.assert_called()
+    closed = [u for u in updates if u.closed_trade is not None][0].closed_trade
+    assert closed.exit_reason == "early_exit"
+
+
+def test_time_stop_triggers_when_unprofitable_after_time_limit():
+    cfg = StrategyConfig(
+        time_stop_sec=240,
+        max_holding_sec=1800,
+        early_exit_sec=120,
+        early_exit_r_threshold=-2.0,  # disabled effectively
+        profit_take_sec=0,
+    )
+    mgr = HyperliquidOrderManager(cfg, _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.001", "avgPx": "99.9"}}]}},
+    }
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=99.0, tp1_price=102.0, tp2_price=104.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        risk_dollars=1.0, coin="BTC", best_price=100.0, worst_price=99.9,
+    )
+    # 250 sec elapsed, price=99.9 (slightly negative) -> time_stop triggers
+    updates = mgr.on_trade(TradeEvent(ts_ms=1000 + 250 * 1000, price=99.9, size=1.0))
+    fake_exchange.market_close.assert_called()
+    closed = [u for u in updates if u.closed_trade is not None][0].closed_trade
+    assert closed.exit_reason == "time_stop"
+
+
+def test_trail_from_entry_promotes_stop_when_price_above_entry():
+    cfg = StrategyConfig(
+        trail_from_entry=True,
+        trail_from_entry_factor=0.5,
+        runner_trail_sec=1000,  # disabled in this test
+        max_holding_sec=1800,
+    )
+    mgr = HyperliquidOrderManager(cfg, _live_cfg(), coin="BTC")
+    mgr._exchange = MagicMock()
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=99.0, tp1_price=110.0, tp2_price=120.0,  # TPs far away
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        risk_dollars=1.0, coin="BTC", best_price=100.0, worst_price=100.0,
+    )
+    mgr._last_trade_ms = 1000
+    # Price moves up to 102 -> best=102, trail = entry + (best-entry)*0.5 = 100 + 1 = 101
+    mgr.on_trade(TradeEvent(ts_ms=2000, price=102.0, size=1.0))
+    assert mgr.position is not None
+    assert abs(mgr.position.stop_price - 101.0) < 1e-9
+
+
+def test_post_tp1_trail_uses_trail_factor():
+    cfg = StrategyConfig(
+        trail_after_tp1=True,
+        trail_factor=0.5,
+        max_holding_sec=1800,
+    )
+    mgr = HyperliquidOrderManager(cfg, _live_cfg(), coin="BTC")
+    mgr._exchange = MagicMock()
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=100.0, tp1_price=102.0, tp2_price=120.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.0005,
+        risk_dollars=1.0, coin="BTC", best_price=103.0, worst_price=100.0,
+        tp1_filled=True,  # already partial-closed at TP1
+    )
+    mgr._last_trade_ms = 2000
+    # Price at 103 (already best); trail = entry + (103-100)*0.5 = 100 + 1.5 = 101.5
+    mgr.on_trade(TradeEvent(ts_ms=3000, price=103.0, size=1.0))
+    assert mgr.position is not None
+    assert abs(mgr.position.stop_price - 101.5) < 1e-9

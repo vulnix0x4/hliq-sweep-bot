@@ -292,9 +292,11 @@ class HyperliquidOrderManager:
         if p.side == Side.LONG:
             stop_hit = trade.price <= p.stop_price
             tp1_hit = (not p.tp1_filled) and trade.price >= p.tp1_price
+            tp2_hit = trade.price >= p.tp2_price
         else:
             stop_hit = trade.price >= p.stop_price
             tp1_hit = (not p.tp1_filled) and trade.price <= p.tp1_price
+            tp2_hit = trade.price <= p.tp2_price
 
         if stop_hit:
             return self._close_via_market(trade.ts_ms, "stop_loss", trade.price)
@@ -303,9 +305,94 @@ class HyperliquidOrderManager:
         if tp1_hit:
             out.extend(self._partial_close_tp1(trade.ts_ms, trade.price))
 
-        # Phases C.2.2-C.2.4 will add TP2/trail/time exits here
+        self._maybe_promote_stop(trade.price)
+
+        if tp2_hit and p.qty_remaining > 0:
+            out.extend(self._close_via_market(trade.ts_ms, "tp2", trade.price))
+            return out
+
+        elapsed_sec = (trade.ts_ms - p.opened_ms) / 1000.0
+        if elapsed_sec >= self.cfg.max_holding_sec:
+            out.extend(self._close_via_market(trade.ts_ms, "max_hold", trade.price))
+            return out
+
+        # Early exit: if deeply negative after early_exit_sec, cut losses
+        if (
+            self.cfg.early_exit_sec > 0
+            and elapsed_sec >= self.cfg.early_exit_sec
+            and p.risk_dollars > 0
+        ):
+            unrealized_r = self._unrealized_pnl(trade.price) / p.risk_dollars
+            if unrealized_r <= self.cfg.early_exit_r_threshold:
+                out.extend(self._close_via_market(trade.ts_ms, "early_exit", trade.price))
+                return out
+
+        # Profit time stop: take green when you have it
+        if (
+            self.cfg.profit_take_sec > 0
+            and elapsed_sec >= self.cfg.profit_take_sec
+            and p.risk_dollars > 0
+        ):
+            unrealized_r = self._unrealized_pnl(trade.price) / p.risk_dollars
+            if unrealized_r >= self.cfg.profit_take_min_r:
+                out.extend(self._close_via_market(trade.ts_ms, "profit_take", trade.price))
+                return out
+
+        if elapsed_sec >= self.cfg.time_stop_sec and self._unrealized_pnl(trade.price) <= 0:
+            out.extend(self._close_via_market(trade.ts_ms, "time_stop", trade.price))
+            return out
 
         return out
+
+    def _unrealized_pnl(self, mark_price: float) -> float:
+        if self.position is None:
+            return 0.0
+        p = self.position
+        if p.side == Side.LONG:
+            return (mark_price - p.entry_price) * p.qty_remaining
+        return (p.entry_price - mark_price) * p.qty_remaining
+
+    def _maybe_promote_stop(self, trade_price: float) -> None:
+        if self.position is None:
+            return
+        p = self.position
+
+        # After TP1: aggressive trail
+        if p.tp1_filled and self.cfg.trail_after_tp1:
+            trail = max(0.0, min(1.0, self.cfg.trail_factor))
+            if trail > 0:
+                if p.side == Side.LONG:
+                    new_stop = p.entry_price + (p.best_price - p.entry_price) * trail
+                    if new_stop > p.stop_price:
+                        p.stop_price = new_stop
+                else:
+                    new_stop = p.entry_price - (p.entry_price - p.best_price) * trail
+                    if new_stop < p.stop_price:
+                        p.stop_price = new_stop
+            return
+
+        # Pre-TP1: trail from entry to lock in any favorable movement
+        if self.cfg.trail_from_entry:
+            base_trail = max(0.0, min(1.0, self.cfg.trail_from_entry_factor))
+            # Tighten trail in "runner" phase (after runner_trail_sec)
+            elapsed = (
+                (self._last_trade_ms - p.opened_ms) / 1000.0
+                if self._last_trade_ms > 0
+                else 0.0
+            )
+            if self.cfg.runner_trail_sec > 0 and elapsed >= self.cfg.runner_trail_sec:
+                trail = max(base_trail, min(1.0, self.cfg.runner_trail_factor))
+            else:
+                trail = base_trail
+            if trail > 0:
+                if p.side == Side.LONG and p.best_price > p.entry_price:
+                    new_stop = p.entry_price + (p.best_price - p.entry_price) * trail
+                    if new_stop > p.stop_price:
+                        p.stop_price = new_stop
+                elif p.side == Side.SHORT and p.best_price < p.entry_price:
+                    new_stop = p.entry_price - (p.entry_price - p.best_price) * trail
+                    if new_stop < p.stop_price:
+                        p.stop_price = new_stop
 
     def _partial_close_tp1(self, ts_ms: int, trade_price: float) -> list[ExecutionUpdate]:
         """Partial-close 50% of remaining qty at TP1 via market_close (taker fee)."""
