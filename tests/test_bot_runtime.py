@@ -299,3 +299,24 @@ def test_portfolio_position_limit_config() -> None:
     rc = RiskConfig(portfolio_max_positions=5, max_positions_per_coin=2)
     assert rc.portfolio_max_positions == 5
     assert rc.max_positions_per_coin == 2
+
+
+def test_bot_uses_paper_executor_when_mode_paper(tmp_path):
+    cfg = _app_config(tmp_path)
+    cfg.mode = "paper"
+    bot = SweepBot(cfg)
+    from hliq_bot.execution.order_manager import PaperOrderManager
+    for w in bot._workers.values():
+        assert isinstance(w.executor, PaperOrderManager)
+
+
+def test_bot_uses_hyperliquid_executor_when_mode_live(tmp_path):
+    cfg = _app_config(tmp_path)
+    cfg.mode = "live"
+    cfg.live.allow_live = True
+    cfg.live.agent_private_key = "0x" + "a" * 64
+    cfg.live.main_wallet_address = "0x" + "b" * 40
+    bot = SweepBot(cfg)
+    from hliq_bot.execution.hyperliquid_order_manager import HyperliquidOrderManager
+    for w in bot._workers.values():
+        assert isinstance(w.executor, HyperliquidOrderManager)
