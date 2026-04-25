@@ -199,6 +199,9 @@ class HyperliquidOrderManager:
             if abs(szi) < target_qty * 0.5:
                 continue
             entry_px = float(pos.get("entryPx", pe.entry_price))
+            # Live entries are post-only Alo (maker), so the fee is the maker
+            # rate (negative = rebate received). Mirrors PaperOrderManager parity.
+            entry_fee = entry_px * abs(szi) * self.cfg.maker_fee_pct
             self.position = OpenPosition(
                 signal_id=pe.signal_id,
                 side=pe.side,
@@ -210,6 +213,7 @@ class HyperliquidOrderManager:
                 qty_initial=abs(szi),
                 qty_remaining=abs(szi),
                 risk_dollars=pe.risk_dollars,
+                realized_fees=entry_fee,
                 coin=self.coin,
                 best_price=entry_px,
                 worst_price=entry_px,
@@ -291,12 +295,12 @@ class HyperliquidOrderManager:
             stop_hit = trade.price >= p.stop_price
 
         if stop_hit:
-            return self._close_via_market(trade.ts_ms, "stop_loss")
+            return self._close_via_market(trade.ts_ms, "stop_loss", trade.price)
 
         # Phases C.2.1-C.2.4 will add TP1/TP2/trail/time exits here
         return []
 
-    def _close_via_market(self, ts_ms: int, reason: str) -> list[ExecutionUpdate]:
+    def _close_via_market(self, ts_ms: int, reason: str, trade_price: float) -> list[ExecutionUpdate]:
         p = self.position
         if p is None:
             return []
@@ -315,13 +319,36 @@ class HyperliquidOrderManager:
             # Cannot proceed: leaving position in place. Operator must manually intervene.
             return []
 
-        fill_px = p.entry_price  # fallback if HL response is malformed
+        # The HL SDK returns None when no matching position exists on the
+        # exchange — i.e. our local state has drifted out of sync with HL.
+        # Clear local state cleanly and emit a phantom-close so the journal
+        # records that we tried (but no realized trade exists to book).
+        if result is None:
+            log.warning(
+                "HL market_close returned None for %s — HL has no matching position. "
+                "Clearing local state to resync.",
+                self.coin,
+            )
+            sid = p.signal_id
+            self.position = None
+            return [ExecutionUpdate(
+                ts_ms=ts_ms,
+                event_type=ExecEventType.POSITION_CLOSED,
+                message=f"hl position cleared [{self.live_cfg.network}] ({reason} -> phantom_close): HL had no matching position",
+                signal_id=sid,
+                closed_trade=None,  # no realized trade — phantom close
+            )]
+
+        # Fall back to the trigger trade.price (not entry_price) when the HL
+        # response is malformed: entry_price would silently understate losses
+        # on a stop-out from a fast move.
+        fill_px = trade_price
         if isinstance(result, dict) and result.get("status") == "ok":
             statuses = result.get("response", {}).get("data", {}).get("statuses", [])
             if statuses:
                 st = statuses[0]
                 if "filled" in st:
-                    fill_px = float(st["filled"].get("avgPx", p.entry_price))
+                    fill_px = float(st["filled"].get("avgPx", trade_price))
 
         pnl_gross = (
             (fill_px - p.entry_price) * p.qty_remaining
@@ -334,6 +361,7 @@ class HyperliquidOrderManager:
         fees_paid = p.realized_fees + final_fee
         pnl_net = pnl_gross - fees_paid
         risk = max(p.risk_dollars, 1e-9)
+        hold_sec = max(0.0, (ts_ms - p.opened_ms) / 1000.0)
         closed = ClosedTrade(
             signal_id=p.signal_id,
             side=p.side,
@@ -356,7 +384,7 @@ class HyperliquidOrderManager:
         return [ExecutionUpdate(
             ts_ms=ts_ms,
             event_type=ExecEventType.POSITION_CLOSED,
-            message=f"hl position closed [{self.live_cfg.network}] ({reason}): pnl={pnl_net:.4f} fees={fees_paid:.4f}",
+            message=f"hl position closed [{self.live_cfg.network}] ({reason}): pnl={pnl_net:.4f} fees={fees_paid:.4f} hold_sec={hold_sec:.1f}",
             signal_id=p.signal_id,
             closed_trade=closed,
         )]
