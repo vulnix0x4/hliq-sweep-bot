@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Any
 
 from hliq_bot.analytics.market_capture import MarketCaptureWriter
 from hliq_bot.analytics.journal import SignalJournal
@@ -28,13 +29,21 @@ from hliq_bot.signal.vwap_tracker import VWAPTracker
 log = logging.getLogger(__name__)
 
 
+def _make_executor(config: AppConfig, coin: str):
+    """Pick paper or live executor based on cfg.mode."""
+    if config.mode == "live":
+        from hliq_bot.execution.hyperliquid_order_manager import HyperliquidOrderManager
+        return HyperliquidOrderManager(config.strategy, config.live, coin=coin)
+    return PaperOrderManager(config.strategy)
+
+
 @dataclass
 class CoinWorker:
     """Per-coin state: bar builder, detector, executor, trackers, and microstructure data."""
     coin: str
     bar_builder: BarBuilder
     detector: SweepDetector
-    executor: PaperOrderManager
+    executor: Any
     session_tracker: SessionTracker
     vwap_tracker: VWAPTracker
     last_spread_bps: float = 0.0
@@ -89,7 +98,7 @@ class SweepBot:
                     vwap_tracker=vt,
                     coin=coin,
                 ),
-                executor=PaperOrderManager(config.strategy),
+                executor=_make_executor(config, coin=coin),
                 session_tracker=st,
                 vwap_tracker=vt,
                 recent_bar_ranges=deque(maxlen=range_maxlen),

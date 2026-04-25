@@ -18,13 +18,15 @@ def _setup_logging() -> None:
 async def _run() -> None:
     cfg = load_config()
     bot = SweepBot(cfg)
-    if cfg.mode == "paper":
+    if cfg.mode in {"paper", "live"}:
         await bot.run()
         return
     if cfg.mode == "replay":
         bot.run_replay(load_market_events(cfg.replay.input_path))
         return
-    raise ValueError(f"Unsupported BOT_MODE={cfg.mode!r}. Supported modes: 'paper', 'replay'.")
+    raise ValueError(
+        f"Unsupported BOT_MODE={cfg.mode!r}. Supported modes: 'paper', 'live', 'replay'."
+    )
 
 
 def main() -> None:
