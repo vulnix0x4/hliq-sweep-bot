@@ -265,3 +265,80 @@ def test_fill_detection_ignores_other_coins():
     # No matching BTC position -> no transition
     assert mgr.position is None
     assert mgr.pending_entry is not None
+
+
+def test_fill_detected_when_expiry_cancel_races_fill():
+    """If a fill happens at the same tick as expiry, the fill should win
+    (don't cancel a position we already have)."""
+    mgr = HyperliquidOrderManager(StrategyConfig(pending_entry_expiry_sec=120), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 12345}}]}},
+    }
+    fake_info = MagicMock()
+    fake_info.user_state.return_value = {
+        "assetPositions": [{"position": {"coin": "BTC", "szi": "0.001", "entryPx": "100.0"}}],
+    }
+    mgr._exchange = fake_exchange
+    mgr._info = fake_info
+
+    sig = _signal()
+    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    # Tick well past expiry — but HL says we're filled
+    expired_ms = sig.created_ms + (200 * 1000)
+    updates = mgr.on_trade(TradeEvent(ts_ms=expired_ms, price=100.5, size=1.0))
+
+    # Fill detected -> position set, no cancel attempted, ENTRY_FILLED emitted (NOT ORDER_CANCELED)
+    assert mgr.position is not None
+    assert any(u.event_type == ExecEventType.ENTRY_FILLED for u in updates)
+    assert all(u.event_type != ExecEventType.ORDER_CANCELED for u in updates)
+    fake_exchange.cancel_by_cloid.assert_not_called()
+
+
+def test_fill_detection_rejects_opposite_side_position():
+    """LONG entry should NOT match a SHORT position in the same coin."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 12345}}]}},
+    }
+    fake_info = MagicMock()
+    fake_info.user_state.return_value = {
+        "assetPositions": [{"position": {"coin": "BTC", "szi": "-0.001", "entryPx": "100.0"}}],
+    }
+    mgr._exchange = fake_exchange
+    mgr._info = fake_info
+
+    sig = _signal()  # LONG signal
+    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    out = mgr.on_trade(TradeEvent(ts_ms=sig.created_ms + 1500, price=100.0, size=1.0))
+    # Wrong-side szi should NOT trigger fill
+    assert mgr.position is None
+    assert mgr.pending_entry is not None
+
+
+def test_fill_polling_rate_limited_to_1_per_second():
+    """Multiple trade ticks within 1s should only poll user_state once."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 12345}}]}},
+    }
+    fake_info = MagicMock()
+    fake_info.user_state.return_value = {"assetPositions": []}
+    mgr._exchange = fake_exchange
+    mgr._info = fake_info
+
+    sig = _signal()
+    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    # 5 ticks in 500ms -> only 1 poll
+    base = sig.created_ms + 1000
+    for offset in (0, 100, 200, 300, 400):
+        mgr.on_trade(TradeEvent(ts_ms=base + offset, price=100.0, size=1.0))
+    assert fake_info.user_state.call_count == 1
+    # Tick at +1100ms (> 1s after first poll) -> second poll allowed
+    mgr.on_trade(TradeEvent(ts_ms=base + 1100, price=100.0, size=1.0))
+    assert fake_info.user_state.call_count == 2

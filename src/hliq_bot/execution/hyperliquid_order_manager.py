@@ -60,6 +60,8 @@ class HyperliquidOrderManager:
         self.position: OpenPosition | None = None
         self._last_trade_ms: int = 0
         self._pending_oid: int | None = None
+        self._last_fill_poll_ms: int = 0
+        self._agent_addr: str | None = None
         # SDK clients — constructed on first network operation.
         self._exchange: Any = None
         self._info: Any = None
@@ -149,15 +151,22 @@ class HyperliquidOrderManager:
     def on_trade(self, trade: TradeEvent) -> list[ExecutionUpdate]:
         self._last_trade_ms = trade.ts_ms
         updates: list[ExecutionUpdate] = []
-        updates.extend(self._maybe_expire_pending(trade.ts_ms))
+        # Detect fill FIRST: if HL filled our order, that supersedes expiry.
         updates.extend(self._maybe_detect_fill(trade.ts_ms))
+        # Only expire if no fill happened (pending_entry still set).
+        updates.extend(self._maybe_expire_pending(trade.ts_ms))
         # Phase C will add position management here
         return updates
 
     def _maybe_detect_fill(self, now_ms: int) -> list[ExecutionUpdate]:
         """Poll info.user_state to see if our pending entry has been filled."""
-        if self.pending_entry is None or self.position is not None:
+        pe = self.pending_entry
+        if pe is None or self.position is not None:
             return []
+        # Rate limit: at most 1 user_state poll per second per worker.
+        if now_ms - self._last_fill_poll_ms < 1000:
+            return []
+        self._last_fill_poll_ms = now_ms
         info = self._ensure_info()
         address = self.live_cfg.main_wallet_address or self._agent_address()
         try:
@@ -165,7 +174,7 @@ class HyperliquidOrderManager:
         except Exception as exc:
             log.warning("HL user_state poll failed: %s", exc, exc_info=True)
             return []
-        target_qty = self.pending_entry.qty
+        target_qty = pe.qty
         for ap in state.get("assetPositions", []):
             pos = ap.get("position", {})
             if str(pos.get("coin", "")).upper() != self.coin.upper():
@@ -176,11 +185,19 @@ class HyperliquidOrderManager:
                 szi = float(szi_raw.get("base", 0))
             else:
                 szi = float(szi_raw or 0)
+            # Validate side matches: LONG expects positive szi, SHORT expects negative.
+            expected_long = pe.side == Side.LONG
+            actual_long = szi > 0
+            if expected_long != actual_long:
+                log.warning(
+                    "HL position side mismatch for %s: expected %s, got szi=%s — skipping fill detection",
+                    self.coin, pe.side.value, szi,
+                )
+                continue
             # Only consider this a fill if at least 50% of target qty is on the book
             if abs(szi) < target_qty * 0.5:
                 continue
-            entry_px = float(pos.get("entryPx", self.pending_entry.entry_price))
-            pe = self.pending_entry
+            entry_px = float(pos.get("entryPx", pe.entry_price))
             self.position = OpenPosition(
                 signal_id=pe.signal_id,
                 side=pe.side,
@@ -201,7 +218,7 @@ class HyperliquidOrderManager:
             return [ExecutionUpdate(
                 ts_ms=now_ms,
                 event_type=ExecEventType.ENTRY_FILLED,
-                message=f"hl entry filled: {pe.side.value} qty={szi:.6f} @ {entry_px:.2f}",
+                message=f"hl entry filled [{self.live_cfg.network}]: {pe.side.value} qty={szi:.6f} @ {entry_px:.2f}",
                 signal_id=pe.signal_id,
             )]
         return []
@@ -214,8 +231,10 @@ class HyperliquidOrderManager:
         return self._info
 
     def _agent_address(self) -> str:
-        import eth_account
-        return eth_account.Account.from_key(self.live_cfg.agent_private_key).address
+        if self._agent_addr is None:
+            import eth_account
+            self._agent_addr = eth_account.Account.from_key(self.live_cfg.agent_private_key).address
+        return self._agent_addr
 
     def _maybe_expire_pending(self, now_ms: int) -> list[ExecutionUpdate]:
         if self.pending_entry is None:
