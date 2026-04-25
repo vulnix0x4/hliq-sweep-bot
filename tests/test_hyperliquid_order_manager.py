@@ -182,3 +182,86 @@ def test_pending_entry_clears_state_even_when_cancel_fails():
     canceled = [u for u in updates if u.event_type == ExecEventType.ORDER_CANCELED]
     assert len(canceled) == 1
     assert "CANCEL_FAILED" in canceled[0].message
+
+
+def test_pending_entry_transitions_to_position_on_fill(monkeypatch):
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 12345}}]}},
+    }
+    fake_info = MagicMock()
+    # First call: empty positions. Second: BTC long open at 100.0 size 0.001.
+    fake_info.user_state.side_effect = [
+        {"assetPositions": []},
+        {"assetPositions": [{"position": {"coin": "BTC", "szi": "0.001", "entryPx": "100.0"}}]},
+    ]
+    mgr._exchange = fake_exchange
+    mgr._info = fake_info
+
+    sig = _signal()
+    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+
+    # First tick: not yet filled
+    out1 = mgr.on_trade(TradeEvent(ts_ms=sig.created_ms + 500, price=100.0, size=1.0))
+    assert mgr.position is None
+    assert mgr.pending_entry is not None
+
+    # Second tick: HL reports the position now exists
+    out2 = mgr.on_trade(TradeEvent(ts_ms=sig.created_ms + 1500, price=100.0, size=1.0))
+    assert mgr.position is not None
+    assert mgr.position.entry_price == 100.0
+    assert mgr.position.qty_initial == 0.001
+    assert mgr.pending_entry is None
+    assert any(u.event_type == ExecEventType.ENTRY_FILLED for u in out2)
+
+
+def test_fill_detection_handles_szi_dict_format():
+    """HL sometimes returns szi as a dict {base: '...'} rather than a string."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 12345}}]}},
+    }
+    fake_info = MagicMock()
+    fake_info.user_state.return_value = {
+        "assetPositions": [{
+            "position": {"coin": "BTC", "szi": {"base": "0.001", "quote": "0.1"}, "entryPx": "100.0"},
+        }],
+    }
+    mgr._exchange = fake_exchange
+    mgr._info = fake_info
+
+    sig = _signal()
+    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    mgr.on_trade(TradeEvent(ts_ms=sig.created_ms + 500, price=100.0, size=1.0))
+    assert mgr.position is not None
+    assert mgr.position.qty_initial == 0.001
+
+
+def test_fill_detection_ignores_other_coins():
+    """User state may include positions in other coins — must filter to our coin."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 12345}}]}},
+    }
+    fake_info = MagicMock()
+    fake_info.user_state.return_value = {
+        "assetPositions": [
+            {"position": {"coin": "ETH", "szi": "1.0", "entryPx": "2000.0"}},
+            {"position": {"coin": "SOL", "szi": "10.0", "entryPx": "100.0"}},
+        ],
+    }
+    mgr._exchange = fake_exchange
+    mgr._info = fake_info
+
+    sig = _signal()
+    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    out = mgr.on_trade(TradeEvent(ts_ms=sig.created_ms + 500, price=100.0, size=1.0))
+    # No matching BTC position -> no transition
+    assert mgr.position is None
+    assert mgr.pending_entry is not None
