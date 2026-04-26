@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+
+# Runtime data (personal trade history, captured market events)
+runtime/
+
+# Local secrets / config
+.env
+.claude/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

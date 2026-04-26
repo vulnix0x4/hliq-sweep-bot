@@ -1,0 +1,2 @@
+"""Hyperliquid sweep bot MVP."""
+
