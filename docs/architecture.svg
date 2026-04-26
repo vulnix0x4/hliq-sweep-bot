@@ -1,0 +1,322 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1700" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+  <style>
+    .title { font-size: 28px; font-weight: 700; fill: #111827; }
+    .subtitle { font-size: 16px; fill: #6b7280; }
+    .layer { font-size: 18px; font-weight: 700; }
+    .box-title { font-size: 15px; font-weight: 700; fill: #111827; }
+    .box-line { font-size: 12px; fill: #374151; }
+    .box-mono { font-size: 11px; font-family: ui-monospace,Menlo,monospace; fill: #4b5563; }
+    .legend { font-size: 13px; fill: #374151; }
+    .arrow { fill: #6b7280; }
+    .label { font-size: 11px; fill: #6b7280; font-style: italic; }
+    .ext-fill { fill: #fde68a; stroke: #92400e; stroke-width: 2; }
+    .data-fill { fill: #bfdbfe; stroke: #1e40af; stroke-width: 2; }
+    .signal-fill { fill: #bbf7d0; stroke: #166534; stroke-width: 2; }
+    .gate-fill { fill: #fecaca; stroke: #991b1b; stroke-width: 2; }
+    .exec-fill { fill: #ddd6fe; stroke: #5b21b6; stroke-width: 2; }
+    .store-fill { fill: #e5e7eb; stroke: #374151; stroke-width: 2; }
+    .obs-fill { fill: #fef3c7; stroke: #92400e; stroke-width: 2; }
+    .layer-bg { fill: #f9fafb; stroke: #d1d5db; stroke-dasharray: 5,5; }
+  </style>
+
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#6b7280"/>
+    </marker>
+    <marker id="arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#dc2626"/>
+    </marker>
+  </defs>
+
+  <!-- Header -->
+  <text x="800" y="40" text-anchor="middle" class="title">hliq_bot — Hyperliquid Sweep Reversal Bot</text>
+  <text x="800" y="65" text-anchor="middle" class="subtitle">Paper-trading architecture · BTC / ETH / SOL · 60-second bars · long-only</text>
+
+  <!-- ============= EXCHANGE ============= -->
+  <rect x="40" y="100" width="1520" height="100" rx="8" class="layer-bg"/>
+  <text x="60" y="125" class="layer">1.  EXCHANGE</text>
+  <rect x="650" y="135" width="300" height="55" rx="6" class="ext-fill"/>
+  <text x="800" y="158" text-anchor="middle" class="box-title">Hyperliquid WebSocket</text>
+  <text x="800" y="178" text-anchor="middle" class="box-mono">trades + l2Book · BTC,ETH,SOL</text>
+
+  <!-- ============= DATA LAYER ============= -->
+  <rect x="40" y="220" width="1520" height="160" rx="8" class="layer-bg"/>
+  <text x="60" y="245" class="layer">2.  DATA INGEST</text>
+
+  <rect x="120" y="260" width="320" height="110" rx="6" class="data-fill"/>
+  <text x="280" y="282" text-anchor="middle" class="box-title">HyperliquidWsClient</text>
+  <text x="280" y="302" text-anchor="middle" class="box-mono">data/hyperliquid_ws.py</text>
+  <text x="280" y="324" text-anchor="middle" class="box-line">WS frames → MarketEvent</text>
+  <text x="280" y="342" text-anchor="middle" class="box-line">auto-reconnect on drop</text>
+  <text x="280" y="360" text-anchor="middle" class="box-line">populates queue (max 50k)</text>
+
+  <rect x="640" y="260" width="320" height="110" rx="6" class="data-fill"/>
+  <text x="800" y="282" text-anchor="middle" class="box-title">BarBuilder</text>
+  <text x="800" y="302" text-anchor="middle" class="box-mono">data/bar_builder.py</text>
+  <text x="800" y="324" text-anchor="middle" class="box-line">aggregates trades into 60s bars</text>
+  <text x="800" y="342" text-anchor="middle" class="box-line">OHLCV + VWAP + avg spread</text>
+  <text x="800" y="360" text-anchor="middle" class="box-line">~500 bars history per coin</text>
+
+  <rect x="1160" y="260" width="320" height="110" rx="6" class="store-fill"/>
+  <text x="1320" y="282" text-anchor="middle" class="box-title">MarketCaptureWriter</text>
+  <text x="1320" y="302" text-anchor="middle" class="box-mono">analytics/market_capture.py</text>
+  <text x="1320" y="324" text-anchor="middle" class="box-line">JSONL: kind, ts, coin, price/book</text>
+  <text x="1320" y="342" text-anchor="middle" class="box-line">3.2 GB / 35M events / 42 days</text>
+  <text x="1320" y="360" text-anchor="middle" class="box-line">enables replay backtest</text>
+
+  <!-- ============= SIGNAL LAYER ============= -->
+  <rect x="40" y="400" width="1520" height="220" rx="8" class="layer-bg"/>
+  <text x="60" y="425" class="layer">3.  SIGNAL DETECTION</text>
+
+  <rect x="80" y="440" width="280" height="170" rx="6" class="signal-fill"/>
+  <text x="220" y="462" text-anchor="middle" class="box-title">Level Derivation</text>
+  <text x="220" y="482" text-anchor="middle" class="box-mono">signal/levels.py</text>
+  <text x="220" y="504" text-anchor="middle" class="box-line">prior_15m_high / _low</text>
+  <text x="220" y="522" text-anchor="middle" class="box-line">equal_low_N stacked supports</text>
+  <text x="220" y="540" text-anchor="middle" class="box-line">PDH / PDL (prior day H/L)</text>
+  <text x="220" y="558" text-anchor="middle" class="box-line">VWAP daily / session opens</text>
+  <text x="220" y="576" text-anchor="middle" class="box-line">round numbers (BTC 1k, ETH 100…)</text>
+  <text x="220" y="600" text-anchor="middle" class="box-mono">+ session_tracker, vwap_tracker</text>
+
+  <rect x="440" y="440" width="320" height="170" rx="6" class="signal-fill"/>
+  <text x="600" y="462" text-anchor="middle" class="box-title">SweepDetector</text>
+  <text x="600" y="482" text-anchor="middle" class="box-mono">signal/sweep_detector.py</text>
+  <text x="600" y="504" text-anchor="middle" class="box-line">overshoot 3–24 bps past level</text>
+  <text x="600" y="522" text-anchor="middle" class="box-line">close BACK inside (reclaim ≥ 1.5)</text>
+  <text x="600" y="540" text-anchor="middle" class="box-line">wick:body ≥ 1.1 (capped at 20)</text>
+  <text x="600" y="558" text-anchor="middle" class="box-line">volume ≥ 1.0× 20-bar avg</text>
+  <text x="600" y="576" text-anchor="middle" class="box-line">computes confidence + signal_score</text>
+  <text x="600" y="600" text-anchor="middle" class="box-mono">→ SweepSignal candidate</text>
+
+  <rect x="840" y="440" width="280" height="170" rx="6" class="signal-fill"/>
+  <text x="980" y="462" text-anchor="middle" class="box-title">Regime Classifier</text>
+  <text x="980" y="482" text-anchor="middle" class="box-mono">signal/regime.py</text>
+  <text x="980" y="504" text-anchor="middle" class="box-line">range / trend</text>
+  <text x="980" y="522" text-anchor="middle" class="box-line">high_vol (range ≥ 0.5%)</text>
+  <text x="980" y="540" text-anchor="middle" class="box-line">illiquid (spread blown)</text>
+  <text x="980" y="558" text-anchor="middle" class="box-line">trend_bps over lookback</text>
+  <text x="980" y="600" text-anchor="middle" class="box-mono">decides per-regime sizing</text>
+
+  <rect x="1200" y="440" width="280" height="170" rx="6" class="signal-fill"/>
+  <text x="1340" y="462" text-anchor="middle" class="box-title">Session / VWAP</text>
+  <text x="1340" y="482" text-anchor="middle" class="box-mono">signal/session_tracker.py</text>
+  <text x="1340" y="504" text-anchor="middle" class="box-line">UTC bucketing:</text>
+  <text x="1340" y="522" text-anchor="middle" class="box-line">asia 00–07, eu 07–13,</text>
+  <text x="1340" y="540" text-anchor="middle" class="box-line">us 13–22, late 22–24</text>
+  <text x="1340" y="558" text-anchor="middle" class="box-line">prior-day H/L, session opens</text>
+  <text x="1340" y="600" text-anchor="middle" class="box-mono">VWAPTracker (daily reset)</text>
+
+  <!-- ============= GATE PIPELINE ============= -->
+  <rect x="40" y="640" width="1520" height="320" rx="8" class="layer-bg"/>
+  <text x="60" y="665" class="layer">4.  GATE PIPELINE — every candidate must pass ALL of these</text>
+
+  <!-- Row 1 -->
+  <rect x="60" y="685" width="200" height="80" rx="6" class="gate-fill"/>
+  <text x="160" y="710" text-anchor="middle" class="box-title">Exposure</text>
+  <text x="160" y="730" text-anchor="middle" class="box-line">already in position?</text>
+  <text x="160" y="750" text-anchor="middle" class="box-line">portfolio cap (3)</text>
+
+  <rect x="280" y="685" width="200" height="80" rx="6" class="gate-fill"/>
+  <text x="380" y="710" text-anchor="middle" class="box-title">Funding Blackout</text>
+  <text x="380" y="730" text-anchor="middle" class="box-line">90s before 8h funding</text>
+  <text x="380" y="750" text-anchor="middle" class="box-line">avoid funding cliff</text>
+
+  <rect x="500" y="685" width="200" height="80" rx="6" class="gate-fill"/>
+  <text x="600" y="710" text-anchor="middle" class="box-title">Microstructure</text>
+  <text x="600" y="730" text-anchor="middle" class="box-line">OFI ≥ 0.06</text>
+  <text x="600" y="750" text-anchor="middle" class="box-line">queue imb ≥ 0.03</text>
+
+  <rect x="720" y="685" width="200" height="80" rx="6" class="gate-fill"/>
+  <text x="820" y="710" text-anchor="middle" class="box-title">Session Pause</text>
+  <text x="820" y="730" text-anchor="middle" class="box-line">n≥15 trades AND</text>
+  <text x="820" y="750" text-anchor="middle" class="box-line">avg_R ≤ −0.40 → block</text>
+
+  <rect x="940" y="685" width="200" height="80" rx="6" class="gate-fill"/>
+  <text x="1040" y="710" text-anchor="middle" class="box-title">Level Pause</text>
+  <text x="1040" y="730" text-anchor="middle" class="box-line">n≥10 same level AND</text>
+  <text x="1040" y="750" text-anchor="middle" class="box-line">avg_R ≤ −0.40 → block</text>
+
+  <rect x="1160" y="685" width="200" height="80" rx="6" class="gate-fill"/>
+  <text x="1260" y="710" text-anchor="middle" class="box-title">Side Pause</text>
+  <text x="1260" y="730" text-anchor="middle" class="box-line">n≥8 (long/short)</text>
+  <text x="1260" y="750" text-anchor="middle" class="box-line">timed cooldown 15m</text>
+
+  <rect x="1380" y="685" width="160" height="80" rx="6" class="gate-fill"/>
+  <text x="1460" y="710" text-anchor="middle" class="box-title">Regime Block</text>
+  <text x="1460" y="730" text-anchor="middle" class="box-line">high_vol / illiquid</text>
+  <text x="1460" y="750" text-anchor="middle" class="box-line">→ skip</text>
+
+  <!-- Row 2 -->
+  <rect x="60" y="785" width="200" height="80" rx="6" class="gate-fill"/>
+  <text x="160" y="810" text-anchor="middle" class="box-title">Confidence Floor</text>
+  <text x="160" y="830" text-anchor="middle" class="box-line">range ≥ 0.60</text>
+  <text x="160" y="850" text-anchor="middle" class="box-line">trend ≥ 0.72</text>
+
+  <rect x="280" y="785" width="200" height="80" rx="6" class="gate-fill"/>
+  <text x="380" y="810" text-anchor="middle" class="box-title">ML Gate (off)</text>
+  <text x="380" y="830" text-anchor="middle" class="box-line">ml/gate.py — disabled</text>
+  <text x="380" y="850" text-anchor="middle" class="box-line">overfit, 39 samples</text>
+
+  <rect x="500" y="785" width="200" height="80" rx="6" class="gate-fill"/>
+  <text x="600" y="810" text-anchor="middle" class="box-title">Daily Loss Limit</text>
+  <text x="600" y="830" text-anchor="middle" class="box-line">≤ −2.5 R per UTC day</text>
+  <text x="600" y="850" text-anchor="middle" class="box-line">resets at midnight</text>
+
+  <rect x="720" y="785" width="200" height="80" rx="6" class="gate-fill"/>
+  <text x="820" y="810" text-anchor="middle" class="box-title">Hard-Loss Cooldown</text>
+  <text x="820" y="830" text-anchor="middle" class="box-line">last R ≤ −0.9 → 5min</text>
+  <text x="820" y="850" text-anchor="middle" class="box-line">side: 30min, level: 1h</text>
+
+  <rect x="940" y="785" width="200" height="80" rx="6" class="gate-fill"/>
+  <text x="1040" y="810" text-anchor="middle" class="box-title">Spread Limit</text>
+  <text x="1040" y="830" text-anchor="middle" class="box-line">≤ 6 bps</text>
+  <text x="1040" y="850" text-anchor="middle" class="box-line">skip illiquid moments</text>
+
+  <rect x="1160" y="785" width="200" height="80" rx="6" class="gate-fill"/>
+  <text x="1260" y="810" text-anchor="middle" class="box-title">News Spike</text>
+  <text x="1260" y="830" text-anchor="middle" class="box-line">|move 30s| ≥ 0.5%</text>
+  <text x="1260" y="850" text-anchor="middle" class="box-line">→ skip</text>
+
+  <rect x="1380" y="785" width="160" height="80" rx="6" class="gate-fill"/>
+  <text x="1460" y="810" text-anchor="middle" class="box-title">Vol Circuit</text>
+  <text x="1460" y="830" text-anchor="middle" class="box-line">3 bars all ≥ 0.5%</text>
+  <text x="1460" y="850" text-anchor="middle" class="box-line">→ skip</text>
+
+  <!-- governor caption -->
+  <rect x="280" y="885" width="1040" height="60" rx="6" stroke="#7f1d1d" stroke-width="2" fill="#fef2f2"/>
+  <text x="800" y="908" text-anchor="middle" class="box-title">RiskGovernor   ·   risk/governor.py</text>
+  <text x="800" y="930" text-anchor="middle" class="box-line">orchestrates all gates above + position sizing (0.50% × equity / stop_dist) + perf multiplier + regime multiplier</text>
+
+  <!-- ============= EXECUTION ============= -->
+  <rect x="40" y="980" width="1520" height="240" rx="8" class="layer-bg"/>
+  <text x="60" y="1005" class="layer">5.  EXECUTION (paper) — when gate passes</text>
+
+  <rect x="120" y="1020" width="380" height="180" rx="6" class="exec-fill"/>
+  <text x="310" y="1042" text-anchor="middle" class="box-title">PaperOrderManager</text>
+  <text x="310" y="1062" text-anchor="middle" class="box-mono">execution/order_manager.py</text>
+  <text x="310" y="1085" text-anchor="middle" class="box-line">place limit @ entry (post-only)</text>
+  <text x="310" y="1103" text-anchor="middle" class="box-line">expire pending after 180s</text>
+  <text x="310" y="1121" text-anchor="middle" class="box-line">simulate fill on touch ±2 bps</text>
+  <text x="310" y="1139" text-anchor="middle" class="box-line">track MFE / MAE on every tick</text>
+  <text x="310" y="1162" text-anchor="middle" class="box-line">manage trail (post-TP1: 0.50,</text>
+  <text x="310" y="1180" text-anchor="middle" class="box-line">from-entry: 0.10, runner@5min: 0.45)</text>
+
+  <rect x="540" y="1020" width="380" height="180" rx="6" class="exec-fill"/>
+  <text x="730" y="1042" text-anchor="middle" class="box-title">OpenPosition</text>
+  <text x="730" y="1062" text-anchor="middle" class="box-mono">models.py</text>
+  <text x="730" y="1085" text-anchor="middle" class="box-line">side, qty, entry/stop/TP1/TP2</text>
+  <text x="730" y="1103" text-anchor="middle" class="box-line">tp1_filled flag (50% scale at TP1)</text>
+  <text x="730" y="1121" text-anchor="middle" class="box-line">stop moves to BE after TP1</text>
+  <text x="730" y="1139" text-anchor="middle" class="box-line">tracks best/worst price</text>
+  <text x="730" y="1162" text-anchor="middle" class="box-line">realized + unrealized PnL</text>
+
+  <rect x="960" y="1020" width="540" height="180" rx="6" class="exec-fill"/>
+  <text x="1230" y="1042" text-anchor="middle" class="box-title">Exit Decision Tree (per-tick)</text>
+  <text x="1230" y="1062" text-anchor="middle" class="box-mono">order_manager.py</text>
+  <text x="1230" y="1085" text-anchor="middle" class="box-line">1. stop_loss   — hit hard stop or trailed stop</text>
+  <text x="1230" y="1103" text-anchor="middle" class="box-line">2. tp1         — partial 50%, move stop to BE</text>
+  <text x="1230" y="1121" text-anchor="middle" class="box-line">3. tp2         — close remainder</text>
+  <text x="1230" y="1139" text-anchor="middle" class="box-line">4. early_exit  — R ≤ −0.5 after 240s</text>
+  <text x="1230" y="1162" text-anchor="middle" class="box-line">5. time_stop   — flat after 600s → close</text>
+  <text x="1230" y="1180" text-anchor="middle" class="box-line">6. max_hold    — force close after 1800s</text>
+
+  <!-- ============= PERSISTENCE ============= -->
+  <rect x="40" y="1240" width="1520" height="180" rx="8" class="layer-bg"/>
+  <text x="60" y="1265" class="layer">6.  PERSISTENCE &amp; FEEDBACK</text>
+
+  <rect x="120" y="1280" width="320" height="130" rx="6" class="store-fill"/>
+  <text x="280" y="1302" text-anchor="middle" class="box-title">JournalWriter</text>
+  <text x="280" y="1322" text-anchor="middle" class="box-mono">analytics/journal.py</text>
+  <text x="280" y="1344" text-anchor="middle" class="box-line">runtime/signals.jsonl</text>
+  <text x="280" y="1362" text-anchor="middle" class="box-line">candidate / decision</text>
+  <text x="280" y="1380" text-anchor="middle" class="box-line">lifecycle / outcome</text>
+  <text x="280" y="1398" text-anchor="middle" class="box-line">used for warm-start on restart</text>
+
+  <rect x="480" y="1280" width="320" height="130" rx="6" class="store-fill"/>
+  <text x="640" y="1302" text-anchor="middle" class="box-title">bot.log</text>
+  <text x="640" y="1322" text-anchor="middle" class="box-mono">runtime/bot.log</text>
+  <text x="640" y="1344" text-anchor="middle" class="box-line">Heartbeat lines (60s)</text>
+  <text x="640" y="1362" text-anchor="middle" class="box-line">Detector diagnostics</text>
+  <text x="640" y="1380" text-anchor="middle" class="box-line">block reasons</text>
+  <text x="640" y="1398" text-anchor="middle" class="box-line">errors / WS reconnects</text>
+
+  <rect x="840" y="1280" width="320" height="130" rx="6" class="store-fill"/>
+  <text x="1000" y="1302" text-anchor="middle" class="box-title">ML state + models</text>
+  <text x="1000" y="1322" text-anchor="middle" class="box-mono">runtime/ml_state.json</text>
+  <text x="1000" y="1344" text-anchor="middle" class="box-mono">runtime/models/gate_model.json</text>
+  <text x="1000" y="1362" text-anchor="middle" class="box-line">currently DISABLED</text>
+  <text x="1000" y="1380" text-anchor="middle" class="box-line">overfit (27 features × 39 samples)</text>
+  <text x="1000" y="1398" text-anchor="middle" class="box-line">retrain when ≥ 200 outcomes</text>
+
+  <rect x="1200" y="1280" width="320" height="130" rx="6" class="store-fill"/>
+  <text x="1360" y="1302" text-anchor="middle" class="box-title">market_events.jsonl</text>
+  <text x="1360" y="1322" text-anchor="middle" class="box-mono">runtime/market_events.jsonl</text>
+  <text x="1360" y="1344" text-anchor="middle" class="box-line">3.2 GB raw capture</text>
+  <text x="1360" y="1362" text-anchor="middle" class="box-line">35M trade + book events</text>
+  <text x="1360" y="1380" text-anchor="middle" class="box-line">42 days BTC/ETH/SOL</text>
+  <text x="1360" y="1398" text-anchor="middle" class="box-line">→ deterministic replay</text>
+
+  <!-- ============= TOOLING ============= -->
+  <rect x="40" y="1440" width="1520" height="160" rx="8" class="layer-bg"/>
+  <text x="60" y="1465" class="layer">7.  TOOLING / OPS</text>
+
+  <rect x="120" y="1480" width="320" height="100" rx="6" class="obs-fill"/>
+  <text x="280" y="1502" text-anchor="middle" class="box-title">scripts/botctl.sh</text>
+  <text x="280" y="1522" text-anchor="middle" class="box-line">up · down · restart · logs · stats</text>
+  <text x="280" y="1542" text-anchor="middle" class="box-line">replay · report · ml-status</text>
+  <text x="280" y="1562" text-anchor="middle" class="box-line">snapshot</text>
+
+  <rect x="480" y="1480" width="320" height="100" rx="6" class="obs-fill"/>
+  <text x="640" y="1502" text-anchor="middle" class="box-title">paper_stats.py</text>
+  <text x="640" y="1522" text-anchor="middle" class="box-line">parse bot.log</text>
+  <text x="640" y="1542" text-anchor="middle" class="box-line">PnL, win rate, exit-reason mix</text>
+  <text x="640" y="1562" text-anchor="middle" class="box-line">avg hold, drawdown</text>
+
+  <rect x="840" y="1480" width="320" height="100" rx="6" class="obs-fill"/>
+  <text x="1000" y="1502" text-anchor="middle" class="box-title">journal_report.py</text>
+  <text x="1000" y="1522" text-anchor="middle" class="box-line">parse signals.jsonl</text>
+  <text x="1000" y="1542" text-anchor="middle" class="box-line">funnel cand → allowed → fill</text>
+  <text x="1000" y="1562" text-anchor="middle" class="box-line">break-down by session/level/regime</text>
+
+  <rect x="1200" y="1480" width="320" height="100" rx="6" class="obs-fill"/>
+  <text x="1360" y="1502" text-anchor="middle" class="box-title">replay_capture.py</text>
+  <text x="1360" y="1522" text-anchor="middle" class="box-line">3.2 GB capture → bot pipeline</text>
+  <text x="1360" y="1542" text-anchor="middle" class="box-line">writes replay_signals.jsonl</text>
+  <text x="1360" y="1562" text-anchor="middle" class="box-line">deterministic backtest</text>
+
+  <!-- Layer-spanning arrows -->
+  <line x1="800" y1="200" x2="800" y2="245" stroke="#6b7280" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="280" y1="370" x2="280" y2="400" stroke="#6b7280" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="600" y1="370" x2="600" y2="440" stroke="#6b7280" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="1320" y1="370" x2="1320" y2="1280" stroke="#6b7280" stroke-width="1" stroke-dasharray="4,4" marker-end="url(#arr)"/>
+  <text x="1340" y="700" class="label">capture stream</text>
+
+  <!-- Signal -> Gate -->
+  <line x1="600" y1="610" x2="600" y2="685" stroke="#dc2626" stroke-width="2" marker-end="url(#arr-r)"/>
+  <text x="620" y="650" class="label" fill="#dc2626">SweepSignal</text>
+
+  <!-- Gate -> Execution -->
+  <line x1="800" y1="945" x2="800" y2="1020" stroke="#16a34a" stroke-width="2" marker-end="url(#arr)"/>
+  <text x="820" y="985" class="label" fill="#16a34a">allowed</text>
+
+  <!-- Execution -> Persistence -->
+  <line x1="280" y1="1200" x2="280" y2="1280" stroke="#6b7280" stroke-width="2" marker-end="url(#arr)"/>
+  <text x="300" y="1245" class="label">outcome</text>
+
+  <!-- Replay loop -->
+  <path d="M 1360,1480 Q 1550,1300 1500,1280" stroke="#92400e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="1500" y="1430" class="label">replay loop</text>
+
+  <!-- Legend -->
+  <rect x="40" y="1620" width="1520" height="60" rx="6" fill="#f3f4f6" stroke="#d1d5db"/>
+  <text x="60" y="1645" class="legend"><tspan font-weight="700">Legend:</tspan></text>
+  <rect x="160" y="1632" width="20" height="14" class="ext-fill"/><text x="190" y="1645" class="legend">External</text>
+  <rect x="280" y="1632" width="20" height="14" class="data-fill"/><text x="310" y="1645" class="legend">Data</text>
+  <rect x="380" y="1632" width="20" height="14" class="signal-fill"/><text x="410" y="1645" class="legend">Signal</text>
+  <rect x="470" y="1632" width="20" height="14" class="gate-fill"/><text x="500" y="1645" class="legend">Gate / Risk</text>
+  <rect x="600" y="1632" width="20" height="14" class="exec-fill"/><text x="630" y="1645" class="legend">Execution</text>
+  <rect x="720" y="1632" width="20" height="14" class="store-fill"/><text x="750" y="1645" class="legend">Persistence</text>
+  <rect x="850" y="1632" width="20" height="14" class="obs-fill"/><text x="880" y="1645" class="legend">Tooling</text>
+  <text x="1100" y="1645" class="legend">Today: 32 paper trades · 100% WR · +$25.33 net · gates released · live exec NOT BUILT</text>
+  <text x="60" y="1670" class="legend" font-style="italic">Data flow: Hyperliquid WS → Bars → Levels + Detector → Gate Pipeline → PaperOrderManager → Journal → (warm-start on restart, tooling reads)</text>
+</svg>
