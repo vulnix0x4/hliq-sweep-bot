@@ -11,8 +11,11 @@ This is a paper-trading-first implementation of the strategy you sketched:
 
 ## Current status
 
-- Implemented: `paper` mode and offline `replay` mode from captured market events
-- Not implemented yet: authenticated live order routing to Hyperliquid exchange API
+- **Paper mode** and offline **replay mode** — production-stable, default
+- **Live mode** (Hyperliquid mainnet/testnet) — adapter implemented, gated behind `BOT_MODE=live` + `BOT_ALLOW_LIVE=true`. Requires a one-time agent-wallet approval via `scripts/approve_agent.py`. Operator-facing emergency exit via `scripts/flatten_live.py`. **Run on testnet for at least a week before mainnet.**
+- 134 unit tests covering both paths.
+
+See `docs/plans/2026-04-25-hyperliquid-live-execution.md` for the live rollout playbook (Phases E/F/G).
 
 ## Project layout
 

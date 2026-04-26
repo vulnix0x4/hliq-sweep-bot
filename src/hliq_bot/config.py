@@ -138,6 +138,9 @@ class RiskConfig:
     daily_loss_limit_r: float = 2.5
     max_leverage: float = 8.0
     min_qty: float = 0.0001
+    # Advisory only — currently NOT enforced. portfolio_max_positions is the
+    # actual cap. max_positions_per_coin is implicitly 1 because each coin
+    # has a single executor and has_exposure() blocks re-entry.
     max_open_positions: int = 1
     max_positions_per_coin: int = 1
     portfolio_max_positions: int = 3

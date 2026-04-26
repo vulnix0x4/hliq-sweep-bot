@@ -301,6 +301,44 @@ def test_portfolio_position_limit_config() -> None:
     assert rc.max_positions_per_coin == 2
 
 
+def test_total_exposure_count_includes_pending_entries(tmp_path: Path) -> None:
+    """Pending entries must count toward portfolio cap.
+
+    Regression test: previous _total_open_positions only checked executor.position,
+    so N coins with simultaneous pending entries would all bypass
+    portfolio_max_positions before any of them filled.
+    """
+    from hliq_bot.models import PendingEntry, Side
+
+    cfg = _app_config(tmp_path)
+    cfg.feed.coins_str = "BTC,ETH,SOL"
+    bot = SweepBot(cfg)
+    assert len(bot._workers) == 3
+
+    # Baseline: nothing open, nothing pending
+    assert bot._total_exposure_count() == 0
+
+    # Set pending_entry on 2 of 3 workers (no positions opened yet)
+    for coin in ("BTC", "ETH"):
+        bot._workers[coin].executor.pending_entry = PendingEntry(
+            side=Side.LONG,
+            qty=0.1,
+            entry_price=100.0,
+            stop_price=99.0,
+            tp1_price=101.0,
+            tp2_price=102.0,
+            created_ms=1_000,
+            expiry_sec=120,
+            level_label="test",
+            risk_dollars=10.0,
+            coin=coin,
+            signal_id=f"sig-{coin}",
+        )
+
+    # Pending entries must count as exposure (the bug: would have returned 0)
+    assert bot._total_exposure_count() == 2
+
+
 def test_bot_uses_paper_executor_when_mode_paper(tmp_path):
     cfg = _app_config(tmp_path)
     cfg.mode = "paper"

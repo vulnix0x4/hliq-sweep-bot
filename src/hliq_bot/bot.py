@@ -532,11 +532,17 @@ class SweepBot:
         # Backward compat: untagged events go to first worker (single-coin mode)
         return self._first_worker
 
-    def _total_open_positions(self) -> int:
-        """Count total open positions across all coin workers."""
+    def _total_exposure_count(self) -> int:
+        """Count total exposure (open positions + pending entries) across all coin workers.
+
+        Pending limit orders count as exposure because they can fill into a position
+        at any moment. Counting only open positions allows N+1 simultaneous pending
+        entries to bypass portfolio_max_positions. Names changed from
+        _total_open_positions for clarity.
+        """
         count = 0
         for w in self._workers.values():
-            if w.executor.position is not None:
+            if w.executor.position is not None or w.executor.pending_entry is not None:
                 count += 1
         return count
 
@@ -701,7 +707,7 @@ class SweepBot:
                 continue
 
             # Portfolio-level position limit
-            if self._total_open_positions() >= self.cfg.risk.portfolio_max_positions:
+            if self._total_exposure_count() >= self.cfg.risk.portfolio_max_positions:
                 self._signals_blocked += 1
                 self.journal.write(
                     "decision",
