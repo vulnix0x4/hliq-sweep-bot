@@ -1,0 +1,105 @@
+%% hliq_bot architecture - paste into https://mermaid.live or any Mermaid renderer
+flowchart TB
+
+  subgraph Exchange["Hyperliquid Exchange"]
+    WS["WebSocket Feed<br/>trades + l2Book<br/>BTC, ETH, SOL"]
+  end
+
+  subgraph DataLayer["Data Layer"]
+    WSClient["HyperliquidWsClient<br/>data/hyperliquid_ws.py"]
+    BarBuilder["BarBuilder<br/>data/bar_builder.py<br/>60s OHLCV bars"]
+    Capture["MarketCaptureWriter<br/>analytics/market_capture.py<br/>3.2 GB JSONL"]
+  end
+
+  subgraph SignalLayer["Signal Layer"]
+    Levels["Level Derivation<br/>signal/levels.py<br/>prior_15m, equal_lows, PDH/PDL,<br/>VWAP, round numbers"]
+    Detector["SweepDetector<br/>signal/sweep_detector.py<br/>overshoot 3-24bps + reclaim 1.5bps<br/>+ wick + volume"]
+    Regime["Regime Classifier<br/>signal/regime.py<br/>range/trend/high_vol/illiquid"]
+    Session["SessionTracker<br/>signal/session_tracker.py<br/>asia/eu/us/late"]
+    VWAP["VWAPTracker<br/>signal/vwap_tracker.py"]
+  end
+
+  subgraph GatePipeline["Gate Pipeline (signals to allow/block)"]
+    Exposure["Exposure / Portfolio cap"]
+    Funding["Funding blackout (90s before 8h mark)"]
+    Micro["Microstructure check<br/>OFI + queue imbalance"]
+    SessionGate["Session edge-pause<br/>n>=15, avg_R>-0.40"]
+    LevelGate["Level edge-pause<br/>n>=10, avg_R>-0.40"]
+    SideGate["Side edge-pause<br/>n>=8 trades"]
+    RegimeBlock["Regime block<br/>high_vol / illiquid"]
+    Confidence["Confidence floor<br/>>=0.60 range, >=0.72 trend"]
+    MLGate["ML Gate (disabled)<br/>ml/gate.py"]
+    RiskGov["RiskGovernor<br/>risk/governor.py<br/>daily loss limit, hard-loss cooldown,<br/>news spike, vol circuit"]
+  end
+
+  subgraph Execution["Execution Layer (paper)"]
+    OrderMgr["PaperOrderManager<br/>execution/order_manager.py<br/>limit entry, fill simulation"]
+    Position["OpenPosition<br/>tracks entry, stop, TP1/TP2,<br/>trailing stop, MFE/MAE"]
+    Exits["Exit Decisions<br/>stop_loss / tp1+trail / tp2 /<br/>time_stop 600s / max_hold 1800s /<br/>early_exit / trail_from_entry 0.10"]
+  end
+
+  subgraph Persistence["Persistence"]
+    Journal["JournalWriter<br/>analytics/journal.py<br/>signals.jsonl"]
+    BotLog["bot.log<br/>heartbeats + diagnostics"]
+    MLState["ml_state.json"]
+    Models["models/gate_model.json"]
+  end
+
+  subgraph Observability["Observability"]
+    Stats["scripts/paper_stats.py"]
+    Report["scripts/journal_report.py"]
+    Replay["scripts/replay_capture.py"]
+    BotCtl["scripts/botctl.sh"]
+  end
+
+  %% Live data path
+  WS -->|JSON frames| WSClient
+  WSClient -->|MarketEvent| BarBuilder
+  WSClient -->|MarketEvent| Capture
+  BarBuilder -->|Bar 60s closed| Detector
+  Levels --> Detector
+  Session --> Detector
+  VWAP --> Levels
+
+  %% Signal -> Gate flow
+  Detector -->|SweepSignal candidate| Exposure
+  Regime --> RegimeBlock
+  Exposure --> Funding --> Micro --> SessionGate --> LevelGate --> SideGate --> RegimeBlock --> Confidence --> MLGate --> RiskGov
+  RiskGov -->|allowed| OrderMgr
+  RiskGov -->|blocked| Journal
+
+  %% Order lifecycle
+  OrderMgr -->|PendingEntry| Position
+  Position -->|trade ticks| Exits
+  Exits -->|ClosedTrade| RiskGov
+  Exits -->|ClosedTrade| Journal
+
+  %% Persistence streams
+  Detector -->|candidate| Journal
+  RiskGov -.->|read on warm-start| Journal
+  MLGate -.-> MLState
+  MLGate -.-> Models
+  Capture --> BotLog
+
+  %% Tooling
+  Journal --> Stats
+  Journal --> Report
+  Capture -->|deterministic replay| Replay
+  Replay -->|fresh signals| Journal
+  BotCtl -.->|controls| WSClient
+
+  classDef ext fill:#fde68a,stroke:#92400e,stroke-width:2px
+  classDef data fill:#bfdbfe,stroke:#1e40af
+  classDef signal fill:#bbf7d0,stroke:#166534
+  classDef gate fill:#fecaca,stroke:#991b1b
+  classDef exec fill:#ddd6fe,stroke:#5b21b6
+  classDef store fill:#e5e7eb,stroke:#374151
+  classDef obs fill:#fef3c7,stroke:#92400e
+
+  class WS ext
+  class WSClient,BarBuilder,Capture data
+  class Levels,Detector,Regime,Session,VWAP signal
+  class Exposure,Funding,Micro,SessionGate,LevelGate,SideGate,RegimeBlock,Confidence,MLGate,RiskGov gate
+  class OrderMgr,Position,Exits exec
+  class Journal,BotLog,MLState,Models store
+  class Stats,Report,Replay,BotCtl obs
