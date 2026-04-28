@@ -21,6 +21,9 @@ from hliq_bot.models import (
 
 log = logging.getLogger(__name__)
 
+# Hyperliquid platform-wide minimum order notional (verified via fees API + docs 2026-04-28).
+HL_MIN_ORDER_NOTIONAL = 10.0
+
 
 def _cloid_from_signal_id(signal_id: str):
     """Derive a deterministic Cloid from our internal signal_id.
@@ -68,11 +71,42 @@ class HyperliquidOrderManager:
         # SDK clients — constructed on first network operation.
         self._exchange: Any = None
         self._info: Any = None
+        # HL meta cache — szDecimals per coin (lot precision). Loaded lazily.
+        # Tests can set this directly to skip the network call.
+        self._sz_decimals: int | None = None
 
     # ---- Public surface (mirrors PaperOrderManager) ----
 
     def has_exposure(self) -> bool:
         return self.pending_entry is not None or self.position is not None
+
+    def _coin_sz_decimals(self) -> int:
+        """szDecimals for self.coin (e.g. BTC=5, ETH=4, SOL=2). Cached after first lookup."""
+        if self._sz_decimals is not None:
+            return self._sz_decimals
+        info = self._ensure_info()
+        try:
+            meta = info.meta()
+            for u in meta.get("universe", []):
+                if str(u.get("name", "")).upper() == self.coin.upper():
+                    self._sz_decimals = int(u.get("szDecimals", 4))
+                    return self._sz_decimals
+        except Exception as exc:
+            log.warning("Failed to fetch HL meta for %s szDecimals: %s", self.coin, exc, exc_info=True)
+        # Conservative fallback when meta is unavailable: 4 decimals (matches ETH).
+        # Never silently caches the fallback so a later success can recompute.
+        return 4
+
+    def _round_qty_down(self, qty: float) -> float:
+        """Round qty DOWN to the coin's lot size (10^-szDecimals).
+
+        Always rounds down (not nearest) so we never accidentally exceed the
+        intended notional cap or risk budget after rounding.
+        """
+        decimals = self._coin_sz_decimals()
+        multiplier = 10 ** decimals
+        # Floor in integer space to avoid float rounding wobble at the lot boundary.
+        return int(qty * multiplier) / multiplier
 
     def submit_entry(
         self,
@@ -82,12 +116,53 @@ class HyperliquidOrderManager:
         risk_dollars: float,
     ) -> ExecutionUpdate:
         self._guard_live()
+
+        # Step 1: Clamp qty to fit max_notional_per_trade. This replaces the
+        # earlier "raise on over-cap" behavior, which silently dropped every
+        # signal whose risk-based qty produced a notional above the cap (every
+        # signal at small accounts with normal stops). We clamp instead and
+        # journal the clamp event so operators can see what's happening.
+        cap = self.live_cfg.max_notional_per_trade
+        desired_notional = signal.entry_price * qty
+        clamped = False
+        if desired_notional > cap:
+            qty = cap / signal.entry_price
+            clamped = True
+
+        # Step 2: Round qty DOWN to the coin's lot size. ETH (lot 0.0001),
+        # SOL (lot 0.01) etc. require this — sub-lot orders are HL-rejected.
+        qty = self._round_qty_down(qty)
+
+        # Step 3: After clamp + round, the order may now be below HL's
+        # platform-wide $10 minimum notional, OR rounded to zero (qty < lot).
+        # Either way we cannot place: emit ENTRY_REJECTED so bot._maybe_open
+        # can journal the reason and increment the per-reason block counter.
         notional = signal.entry_price * qty
-        if notional > self.live_cfg.max_notional_per_trade:
-            raise RuntimeError(
-                f"order notional ${notional:.2f} exceeds "
-                f"max_notional_per_trade=${self.live_cfg.max_notional_per_trade:.2f}"
+        if qty <= 0 or notional < HL_MIN_ORDER_NOTIONAL:
+            reason = (
+                "below_hl_min_lot" if qty <= 0
+                else "below_hl_min_notional"
             )
+            return ExecutionUpdate(
+                ts_ms=signal.created_ms,
+                event_type=ExecEventType.ENTRY_REJECTED,
+                message=(
+                    f"hl entry rejected ({reason}): qty={qty:.8f} "
+                    f"notional=${notional:.2f} cap=${cap:.2f} "
+                    f"min_notional=${HL_MIN_ORDER_NOTIONAL:.2f} "
+                    f"side={signal.side.value} px={signal.entry_price:.2f}"
+                    + (" CLAMPED" if clamped else "")
+                ),
+                signal_id=signal_id,
+            )
+
+        # Step 4: After clamp/round, recompute risk_dollars to be proportional
+        # to the actual qty. The caller passed the INTENDED risk budget, but
+        # if we clamped, the realized risk is smaller. This keeps r-multiples
+        # honest in the journal (small qty -> small risk -> realistic R).
+        actual_risk = abs(signal.entry_price - signal.stop_price) * qty
+        # Use the smaller of (intended, actual) so we never inflate R.
+        effective_risk = min(risk_dollars, actual_risk) if actual_risk > 0 else risk_dollars
 
         exchange = self._ensure_exchange()
         is_buy = signal.side == Side.LONG
@@ -137,17 +212,22 @@ class HyperliquidOrderManager:
             created_ms=signal.created_ms,
             expiry_sec=self.cfg.pending_entry_expiry_sec,
             level_label=signal.level_label,
-            risk_dollars=risk_dollars,
+            risk_dollars=effective_risk,
             coin=self.coin,
             external_oid=oid,
         )
         # Backup convenience mirror; source of truth is pending_entry.external_oid.
         self._pending_oid = oid
 
+        clamp_msg = f" (CLAMPED from notional ${desired_notional:.2f})" if clamped else ""
         return ExecutionUpdate(
             ts_ms=signal.created_ms,
             event_type=ExecEventType.ENTRY_PLACED,
-            message=f"hl entry placed [{self.live_cfg.network}]: {signal.side.value} qty={qty:.6f} @ {signal.entry_price:.2f} oid={oid}",
+            message=(
+                f"hl entry placed [{self.live_cfg.network}]: {signal.side.value} "
+                f"qty={qty:.8f} @ {signal.entry_price:.2f} notional=${notional:.2f} "
+                f"oid={oid}{clamp_msg}"
+            ),
             signal_id=signal_id,
         )
 

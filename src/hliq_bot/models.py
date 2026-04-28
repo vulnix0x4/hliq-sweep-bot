@@ -168,6 +168,7 @@ class ClosedTrade:
 class ExecEventType(str, Enum):
     ENTRY_PLACED = "entry_placed"
     ENTRY_FILLED = "entry_filled"
+    ENTRY_REJECTED = "entry_rejected"  # pre-flight reject (sub-min-notional, sub-min-lot, etc.)
     PARTIAL_TP = "partial_tp"
     POSITION_CLOSED = "position_closed"
     ORDER_CANCELED = "order_canceled"
