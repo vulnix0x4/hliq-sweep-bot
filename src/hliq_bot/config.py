@@ -116,9 +116,20 @@ class StrategyConfig:
     runner_trail_factor: float = 0.45
     # Fee model (Hyperliquid Tier 0 perp defaults: -0.015% maker rebate, +0.045% taker fee).
     # Applied in PaperOrderManager: entry assumed maker, taker-style exits (stop_loss,
-    # max_hold, time_stop, early_exit, profit_take) pay taker; tp1/tp2 limit exits pay maker.
+    # max_hold, time_stop, early_exit, profit_take) pay taker; tp2 limit exit pays maker.
     maker_fee_pct: float = -0.00015
     taker_fee_pct: float = 0.00045
+    # Paper-fill realism. Defaults model live HL behavior:
+    #   - entries are post-only Alo limits → no slippage (price = entry_price)
+    #   - exits triggered by software (stop, trail, max_hold, etc.) call market_close
+    #     which eats taker fee + book slippage
+    #   - tp1 partial is also a software-triggered market_close (taker), not a maker limit
+    #   - tp2 is a real resting limit order → still maker, no slippage
+    # Set BOT_PAPER_EXIT_SLIPPAGE_BPS=0 + BOT_PAPER_TP1_IS_TAKER=false to restore the
+    # legacy frictionless paper behavior (useful for back-comparing replays).
+    paper_entry_slippage_bps: float = 0.0
+    paper_exit_slippage_bps: float = 1.5
+    paper_tp1_is_taker: bool = True
 
 
 @dataclass(slots=True)
@@ -316,6 +327,9 @@ def load_config() -> AppConfig:
         runner_trail_factor=_env_float("BOT_RUNNER_TRAIL_FACTOR", 0.45),
         maker_fee_pct=_env_float("BOT_MAKER_FEE_PCT", -0.00015),
         taker_fee_pct=_env_float("BOT_TAKER_FEE_PCT", 0.00045),
+        paper_entry_slippage_bps=_env_float("BOT_PAPER_ENTRY_SLIPPAGE_BPS", 0.0),
+        paper_exit_slippage_bps=_env_float("BOT_PAPER_EXIT_SLIPPAGE_BPS", 1.5),
+        paper_tp1_is_taker=_env_bool("BOT_PAPER_TP1_IS_TAKER", True),
     )
 
     risk = RiskConfig(

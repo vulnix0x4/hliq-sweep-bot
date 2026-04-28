@@ -71,6 +71,11 @@ class CoinWorker:
 
 class SweepBot:
     def __init__(self, config: AppConfig) -> None:
+        if config.risk.portfolio_max_positions < 1:
+            raise ValueError(
+                f"risk.portfolio_max_positions must be >= 1 "
+                f"(got {config.risk.portfolio_max_positions}); 0 would block all trading"
+            )
         self.cfg = config
         self._time_override_ms: int | None = None
         self._suspend_auto_train = False
@@ -141,6 +146,8 @@ class SweepBot:
         self._bars_closed = 0
         self._signals_seen = 0
         self._signals_blocked = 0
+        # Per-reason breakdown of _signals_blocked for ops visibility (heartbeat + summary).
+        self._block_reasons: dict[str, int] = {}
         self._entries_placed = 0
         self._entries_filled = 0
         self._positions_closed = 0
@@ -532,6 +539,17 @@ class SweepBot:
         # Backward compat: untagged events go to first worker (single-coin mode)
         return self._first_worker
 
+    def _count_block(self, reason: str) -> None:
+        """Increment the global blocked counter and the per-reason breakdown.
+
+        `reason` should be a stable bucket name (no embedded floats/IDs). Variable
+        details (thresholds, ML probabilities) belong in the journal entry, not
+        the bucket key, otherwise the heartbeat breakdown becomes a long tail of
+        unique reasons.
+        """
+        self._signals_blocked += 1
+        self._block_reasons[reason] = self._block_reasons.get(reason, 0) + 1
+
     def _total_exposure_count(self) -> int:
         """Count total exposure (open positions + pending entries) across all coin workers.
 
@@ -708,7 +726,7 @@ class SweepBot:
 
             # Portfolio-level position limit
             if self._total_exposure_count() >= self.cfg.risk.portfolio_max_positions:
-                self._signals_blocked += 1
+                self._count_block("portfolio_position_limit")
                 self.journal.write(
                     "decision",
                     signal_id,
@@ -723,7 +741,7 @@ class SweepBot:
                 continue
 
             if self._in_funding_blackout(bar.end_ms):
-                self._signals_blocked += 1
+                self._count_block("funding_blackout")
                 self.journal.write(
                     "decision",
                     signal_id,
@@ -739,7 +757,7 @@ class SweepBot:
 
             micro_check = self._microstructure_check_w(w, signal.side)
             if not micro_check.allowed:
-                self._signals_blocked += 1
+                self._count_block("microstructure")
                 self.journal.write(
                     "decision",
                     signal_id,
@@ -755,7 +773,7 @@ class SweepBot:
 
             session_check = self.risk.can_trade_session(regime.session)
             if not session_check.allowed:
-                self._signals_blocked += 1
+                self._count_block("session_lockout")
                 self.journal.write(
                     "decision",
                     signal_id,
@@ -771,7 +789,7 @@ class SweepBot:
 
             level_check = self.risk.can_trade_level(signal.level_label, ts_ms=bar.end_ms)
             if not level_check.allowed:
-                self._signals_blocked += 1
+                self._count_block("level_cooldown")
                 self.journal.write(
                     "decision",
                     signal_id,
@@ -787,7 +805,7 @@ class SweepBot:
 
             side_check = self.risk.can_trade_side(signal.side, ts_ms=bar.end_ms)
             if not side_check.allowed:
-                self._signals_blocked += 1
+                self._count_block("side_cooldown")
                 self.journal.write(
                     "decision",
                     signal_id,
@@ -802,7 +820,7 @@ class SweepBot:
                 continue
 
             if self._regime_blocks_signal(regime):
-                self._signals_blocked += 1
+                self._count_block("regime_block")
                 reason = f"regime_block:{regime.regime.value}"
                 self.journal.write(
                     "decision",
@@ -819,7 +837,7 @@ class SweepBot:
 
             conf_floor = self.cfg.strategy.min_confidence_trend if regime.regime == Regime.TREND else self.cfg.strategy.min_confidence_range
             if signal.confidence < conf_floor:
-                self._signals_blocked += 1
+                self._count_block("confidence_floor")
                 reason = f"confidence<{conf_floor:.2f}"
                 self.journal.write(
                     "decision",
@@ -837,7 +855,7 @@ class SweepBot:
             ml_decision = self.ml_gate.evaluate(ml_features)
             ml_gate_mode = self._ml_decision_mode()
             if ml_gate_mode == "gate" and not ml_decision.allowed:
-                self._signals_blocked += 1
+                self._count_block("ml_gate")
                 self.journal.write(
                     "decision",
                     signal_id,
@@ -860,7 +878,7 @@ class SweepBot:
 
             check = self.risk.can_open_new_trade(state)
             if not check.allowed:
-                self._signals_blocked += 1
+                self._count_block("risk_governor")
                 log.info("Signal blocked: %s", check.reason)
                 self.journal.write(
                     "decision",
@@ -890,7 +908,7 @@ class SweepBot:
                 cap = max(self.cfg.risk.risk_mult_min, self.cfg.strategy.warmup_risk_mult_cap)
                 risk_mult = min(risk_mult, cap)
             if risk_mult <= 0:
-                self._signals_blocked += 1
+                self._count_block("risk_multiplier_zero")
                 self.journal.write(
                     "decision",
                     signal_id,
@@ -908,7 +926,7 @@ class SweepBot:
 
             sizing = self.risk.size_position(signal.entry_price, signal.stop_price, risk_multiplier=risk_mult)
             if sizing.qty <= 0:
-                self._signals_blocked += 1
+                self._count_block("size_zero")
                 log.info("Signal skipped: size=0 (entry=%.2f stop=%.2f)", signal.entry_price, signal.stop_price)
                 self.journal.write(
                     "decision",
@@ -1393,9 +1411,15 @@ class SweepBot:
                 exposures.append(f"{coin}:pending:{w.executor.pending_entry.side.value}")
         exposure = ",".join(exposures) if exposures else "flat"
         first_w = self._first_worker
+        # Top-N block reasons sorted by count, formatted compactly for the heartbeat.
+        if self._block_reasons:
+            top_reasons = sorted(self._block_reasons.items(), key=lambda kv: -kv[1])[:5]
+            block_breakdown = "(" + " ".join(f"{k}={v}" for k, v in top_reasons) + ")"
+        else:
+            block_breakdown = ""
         log.info(
             (
-                "Heartbeat events(trade=%d book=%d) bars=%d signals=%d blocked=%d "
+                "Heartbeat events(trade=%d book=%d) bars=%d signals=%d blocked=%d%s "
                 "entries(placed=%d filled=%d closed=%d) spread=%.2fbps move30s=%.3f%% "
                 "exposure=%s warmup=%s resolved=%d qsize=%d drops=%d coins=%s"
             ),
@@ -1404,6 +1428,7 @@ class SweepBot:
             self._bars_closed,
             self._signals_seen,
             self._signals_blocked,
+            block_breakdown,
             self._entries_placed,
             self._entries_filled,
             self._positions_closed,
@@ -1432,13 +1457,14 @@ class SweepBot:
             if hasattr(w.executor, "should_refresh_deadman") and w.executor.should_refresh_deadman(now_ms):
                 w.executor.refresh_deadman(now_ms)
 
-    def runtime_summary(self) -> dict[str, float | int]:
+    def runtime_summary(self) -> dict[str, float | int | dict[str, int]]:
         return {
             "trade_events": self._trade_events,
             "book_events": self._book_events,
             "bars_closed": self._bars_closed,
             "signals_seen": self._signals_seen,
             "signals_blocked": self._signals_blocked,
+            "block_reasons": dict(self._block_reasons),
             "entries_placed": self._entries_placed,
             "entries_filled": self._entries_filled,
             "positions_closed": self._positions_closed,

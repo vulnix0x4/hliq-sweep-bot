@@ -301,6 +301,51 @@ def test_portfolio_position_limit_config() -> None:
     assert rc.max_positions_per_coin == 2
 
 
+def test_boot_rejects_zero_portfolio_max_positions(tmp_path: Path) -> None:
+    """portfolio_max_positions=0 would block all trading silently — refuse to boot."""
+    import pytest
+    cfg = _app_config(tmp_path)
+    cfg.risk.portfolio_max_positions = 0
+    with pytest.raises(ValueError, match="portfolio_max_positions"):
+        SweepBot(cfg)
+
+
+def test_count_block_increments_total_and_per_reason(tmp_path: Path) -> None:
+    """_count_block updates both the global counter and the per-reason breakdown."""
+    cfg = _app_config(tmp_path)
+    bot = SweepBot(cfg)
+    assert bot._signals_blocked == 0
+    assert bot._block_reasons == {}
+
+    bot._count_block("portfolio_position_limit")
+    bot._count_block("portfolio_position_limit")
+    bot._count_block("funding_blackout")
+    bot._count_block("microstructure")
+
+    assert bot._signals_blocked == 4
+    assert bot._block_reasons == {
+        "portfolio_position_limit": 2,
+        "funding_blackout": 1,
+        "microstructure": 1,
+    }
+
+
+def test_runtime_summary_includes_block_reasons(tmp_path: Path) -> None:
+    """runtime_summary surfaces the per-reason breakdown so dashboards can read it."""
+    cfg = _app_config(tmp_path)
+    bot = SweepBot(cfg)
+    bot._count_block("ml_gate")
+    bot._count_block("ml_gate")
+    bot._count_block("regime_block")
+
+    summary = bot.runtime_summary()
+    assert summary["signals_blocked"] == 3
+    assert summary["block_reasons"] == {"ml_gate": 2, "regime_block": 1}
+    # Per-reason dict in summary is a copy (mutating it must not affect bot state)
+    summary["block_reasons"]["ml_gate"] = 999
+    assert bot._block_reasons["ml_gate"] == 2
+
+
 def test_total_exposure_count_includes_pending_entries(tmp_path: Path) -> None:
     """Pending entries must count toward portfolio cap.
 

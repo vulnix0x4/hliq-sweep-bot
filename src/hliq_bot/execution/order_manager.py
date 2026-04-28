@@ -23,6 +23,22 @@ class PaperOrderManager:
     def has_exposure(self) -> bool:
         return self.pending_entry is not None or self.position is not None
 
+    def _apply_slippage(self, side: Side, price: float, slippage_bps: float, is_exit: bool) -> float:
+        """Adjust `price` for realistic fill slippage. Direction-aware.
+
+        Long entry: pays UP (worse fill above limit).  Long exit: receives DOWN.
+        Short entry: receives DOWN.                    Short exit: pays UP.
+
+        Returns price unchanged if `slippage_bps` <= 0.
+        """
+        if slippage_bps <= 0:
+            return price
+        factor = slippage_bps / 10_000.0
+        if side == Side.LONG:
+            return price * (1.0 - factor) if is_exit else price * (1.0 + factor)
+        # SHORT
+        return price * (1.0 + factor) if is_exit else price * (1.0 - factor)
+
     def submit_entry(
         self,
         signal: SweepSignal,
@@ -90,29 +106,34 @@ class PaperOrderManager:
         if not touched:
             return []
 
-        entry_notional = pe.entry_price * pe.qty
-        entry_fee = entry_notional * self.cfg.maker_fee_pct  # maker (limit posted at retest)
+        # Realized entry price includes optional slippage (default 0 — Alo entries
+        # are post-only limits, no slippage in the typical case).
+        realized_entry = self._apply_slippage(
+            pe.side, pe.entry_price, self.cfg.paper_entry_slippage_bps, is_exit=False
+        )
+        entry_notional = realized_entry * pe.qty
+        entry_fee = entry_notional * self.cfg.maker_fee_pct  # Alo limit -> maker fee
         self.position = OpenPosition(
             signal_id=pe.signal_id,
             side=pe.side,
-            entry_price=pe.entry_price,
+            entry_price=realized_entry,
             stop_price=pe.stop_price,
             tp1_price=pe.tp1_price,
             tp2_price=pe.tp2_price,
             opened_ms=trade.ts_ms,
             qty_initial=pe.qty,
             qty_remaining=pe.qty,
-            risk_dollars=max(pe.risk_dollars, self._position_risk(pe.entry_price, pe.stop_price, pe.qty)),
+            risk_dollars=max(pe.risk_dollars, self._position_risk(realized_entry, pe.stop_price, pe.qty)),
             realized_fees=entry_fee,
-            best_price=pe.entry_price,
-            worst_price=pe.entry_price,
+            best_price=realized_entry,
+            worst_price=realized_entry,
         )
         self.pending_entry = None
         return [
             ExecutionUpdate(
                 ts_ms=trade.ts_ms,
                 event_type=ExecEventType.ENTRY_FILLED,
-                message=f"paper entry filled: {pe.side.value} qty={pe.qty:.6f} @ {pe.entry_price:.2f}",
+                message=f"paper entry filled: {pe.side.value} qty={pe.qty:.6f} @ {realized_entry:.4f}",
                 signal_id=pe.signal_id,
             )
         ]
@@ -141,19 +162,29 @@ class PaperOrderManager:
 
         if tp1_hit:
             qty = p.qty_remaining * 0.5
-            pnl = pnl_fn(p.tp1_price, qty)
+            # TP1 is software-triggered. In live HL, this is a market_close (taker
+            # + book slippage). In legacy paper mode (paper_tp1_is_taker=False),
+            # it modeled as a maker limit fill at exactly tp1_price.
+            if self.cfg.paper_tp1_is_taker:
+                tp1_fill_price = self._apply_slippage(
+                    p.side, p.tp1_price, self.cfg.paper_exit_slippage_bps, is_exit=True
+                )
+                tp1_fee_pct = self.cfg.taker_fee_pct
+            else:
+                tp1_fill_price = p.tp1_price
+                tp1_fee_pct = self.cfg.maker_fee_pct
+            pnl = pnl_fn(tp1_fill_price, qty)
             p.realized_pnl += pnl
             p.qty_remaining -= qty
             p.tp1_filled = True
-            # TP1 is a limit (maker) fill at the take-profit price.
-            p.realized_fees += (p.tp1_price * qty) * self.cfg.maker_fee_pct
+            p.realized_fees += (tp1_fill_price * qty) * tp1_fee_pct
             # Reduce tail risk after first scale.
             p.stop_price = p.entry_price
             out.append(
                 ExecutionUpdate(
                     ts_ms=trade.ts_ms,
                     event_type=ExecEventType.PARTIAL_TP,
-                    message=f"tp1 partial: qty={qty:.6f} @ {p.tp1_price:.2f}",
+                    message=f"tp1 partial: qty={qty:.6f} @ {tp1_fill_price:.4f}",
                     signal_id=p.signal_id,
                 )
             )
@@ -207,11 +238,19 @@ class PaperOrderManager:
         if self.position is None:
             return []
         p = self.position
-        pnl_gross = p.realized_pnl + pnl_fn(exit_price, p.qty_remaining)
-        # Final exit: tp2 fills as maker (limit), all other reasons are taker-style.
+        # Final exit: tp2 fills as a real resting limit (maker, no slippage).
+        # Everything else is a software-triggered market_close (taker + book slippage).
         final_exit_is_maker = reason == "tp2"
-        final_fee_pct = self.cfg.maker_fee_pct if final_exit_is_maker else self.cfg.taker_fee_pct
-        final_exit_fee = (exit_price * p.qty_remaining) * final_fee_pct
+        if final_exit_is_maker:
+            realized_exit = exit_price
+            final_fee_pct = self.cfg.maker_fee_pct
+        else:
+            realized_exit = self._apply_slippage(
+                p.side, exit_price, self.cfg.paper_exit_slippage_bps, is_exit=True
+            )
+            final_fee_pct = self.cfg.taker_fee_pct
+        pnl_gross = p.realized_pnl + pnl_fn(realized_exit, p.qty_remaining)
+        final_exit_fee = (realized_exit * p.qty_remaining) * final_fee_pct
         fees_paid = p.realized_fees + final_exit_fee
         pnl_net = pnl_gross - fees_paid
         total_qty = p.qty_initial
@@ -221,7 +260,7 @@ class PaperOrderManager:
             signal_id=p.signal_id,
             side=p.side,
             entry_price=p.entry_price,
-            exit_price=exit_price,
+            exit_price=realized_exit,
             qty=total_qty,
             pnl=pnl_net,
             pnl_gross=pnl_gross,
