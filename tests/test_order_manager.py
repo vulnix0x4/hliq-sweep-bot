@@ -241,10 +241,16 @@ def test_fee_modeling_with_tp1_partial_exit():
     assert -0.05 <= ct.fees_paid <= 0.10
 
 
-def test_fee_default_values_match_hl_tier0():
-    """Defaults should be HL Tier 0 rates (can be overridden via env)."""
+def test_fee_default_values_match_hl_retail_tier():
+    """Defaults match HL retail (Tier 0) rates per fees API verified 2026-04-28:
+      userAddRate (maker)  = +0.00015 (paid, NOT a rebate)
+      userCrossRate (taker) = +0.00045
+
+    Maker rebate (-0.00015) only applies to the 'mm' tier — accounts doing
+    ≥0.5% of exchange-wide maker volume — unreachable for retail traders.
+    """
     cfg = StrategyConfig()
-    assert cfg.maker_fee_pct == -0.00015
+    assert cfg.maker_fee_pct == 0.00015   # POSITIVE — paid
     assert cfg.taker_fee_pct == 0.00045
 
 

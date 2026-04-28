@@ -114,10 +114,17 @@ class StrategyConfig:
     trail_from_entry_factor: float = 0.25
     runner_trail_sec: int = 300
     runner_trail_factor: float = 0.45
-    # Fee model (Hyperliquid Tier 0 perp defaults: -0.015% maker rebate, +0.045% taker fee).
+    # Fee model — Hyperliquid retail "Tier 0" rates per fees API (verified 2026-04-28):
+    #   - userAddRate (maker)  = +0.00015 = +0.015%   (POSITIVE — paid, not rebate)
+    #   - userCrossRate (taker) = +0.00045 = +0.045%
+    # Maker REBATE (negative fee) only applies to the `mm` tier — accounts doing
+    # ≥0.5% of exchange-wide maker volume — unreachable for retail. Set
+    # BOT_MAKER_FEE_PCT=-0.00015 only if you've earned mm tier.
     # Applied in PaperOrderManager: entry assumed maker, taker-style exits (stop_loss,
     # max_hold, time_stop, early_exit, profit_take) pay taker; tp2 limit exit pays maker.
-    maker_fee_pct: float = -0.00015
+    # If you have a referral discount (e.g. 4%), adjust both rates manually
+    # (effective maker = 0.000144, taker = 0.000432 at 4% off).
+    maker_fee_pct: float = 0.00015
     taker_fee_pct: float = 0.00045
     # Paper-fill realism. Defaults model live HL behavior:
     #   - entries are post-only Alo limits → no slippage (price = entry_price)
@@ -223,6 +230,16 @@ class LiveConfig:
     deadman_refresh_sec: int = 30  # how often to push the cancel timer forward
 
     def __post_init__(self) -> None:
+        if self.network not in {"mainnet", "testnet"}:
+            raise ValueError(
+                f"LiveConfig.network must be 'mainnet' or 'testnet' (got {self.network!r}); "
+                f"a typo would silently route mainnet credentials to testnet"
+            )
+        if self.deadman_refresh_sec <= 0 or self.deadman_cancel_sec <= 0:
+            raise ValueError(
+                f"deadman_refresh_sec ({self.deadman_refresh_sec}) and "
+                f"deadman_cancel_sec ({self.deadman_cancel_sec}) must both be > 0"
+            )
         if self.deadman_refresh_sec >= self.deadman_cancel_sec:
             raise ValueError(
                 f"deadman_refresh_sec ({self.deadman_refresh_sec}) must be < "
@@ -235,6 +252,16 @@ class LiveConfig:
                 f"deadman_cancel_sec ({self.deadman_cancel_sec}) must be >= "
                 f"2 * deadman_refresh_sec ({self.deadman_refresh_sec}) for safety margin"
             )
+        # Validate agent_private_key format if live trading is enabled, so the
+        # bot fails at boot rather than at the first signal.
+        if self.allow_live and self.agent_private_key:
+            try:
+                import eth_account
+                eth_account.Account.from_key(self.agent_private_key)
+            except Exception as exc:
+                raise ValueError(
+                    f"LiveConfig.agent_private_key is not a valid eth private key: {exc}"
+                ) from exc
 
 
 @dataclass(slots=True)

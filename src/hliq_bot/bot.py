@@ -961,7 +961,45 @@ class SweepBot:
             self._signal_context.setdefault(signal_id, {})
             self._signal_context[signal_id]["ml_prob"] = ml_decision.probability
             self._signal_context[signal_id]["ml_threshold"] = ml_decision.threshold
-            update = w.executor.submit_entry(signal, signal_id=signal_id, qty=sizing.qty, risk_dollars=sizing.risk_dollars)
+            try:
+                update = w.executor.submit_entry(signal, signal_id=signal_id, qty=sizing.qty, risk_dollars=sizing.risk_dollars)
+            except RuntimeError as exc:
+                # SDK/network error mid-submit. submit_entry already logs context.
+                # Journal the failure so the signal isn't silently lost.
+                self._count_block("submit_entry_error")
+                log.warning("submit_entry RuntimeError for signal_id=%s coin=%s: %s",
+                            signal_id, w.coin, exc)
+                self.journal.write(
+                    "decision",
+                    signal_id,
+                    {
+                        "ts_ms": bar.end_ms,
+                        "allowed": False,
+                        "reason": "submit_entry_error",
+                        "error": str(exc),
+                        "coin": w.coin,
+                    },
+                )
+                continue
+
+            # The executor may pre-flight-reject (sub-min-notional, sub-min-lot
+            # after cap-clamp). Treat as a counted block, not a placed entry.
+            if update.event_type == ExecEventType.ENTRY_REJECTED:
+                self._count_block("hl_pre_flight_reject")
+                log.info("Signal blocked: %s", update.message)
+                self.journal.write(
+                    "decision",
+                    signal_id,
+                    {
+                        "ts_ms": update.ts_ms,
+                        "allowed": False,
+                        "reason": "hl_pre_flight_reject",
+                        "message": update.message,
+                        "coin": w.coin,
+                    },
+                )
+                continue
+
             self._entries_placed += 1
             w.entries_placed += 1
             self.journal.write(

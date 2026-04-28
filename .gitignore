@@ -17,3 +17,4 @@ runtime/
 *.swp
 .idea/
 .vscode/
+.testnet_main_wallet.txt

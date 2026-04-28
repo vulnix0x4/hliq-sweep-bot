@@ -42,18 +42,199 @@ def test_refuses_to_submit_when_no_agent_key():
         HyperliquidOrderManager(StrategyConfig(), live_cfg, coin="BTC")
 
 
-def test_refuses_when_notional_exceeds_cap():
-    """Hard notional cap must reject oversized orders even live."""
+def test_clamps_qty_when_notional_exceeds_cap():
+    """When desired notional exceeds cap, the executor clamps qty (and emits a
+    CLAMPED message) instead of raising — so the signal still trades, just smaller.
+
+    Replaces the old "raises RuntimeError" behavior, which silently dropped every
+    signal at small accounts because the worker thread's blanket `except Exception`
+    swallowed it without journaling.
+    """
     live_cfg = LiveConfig(
         allow_live=True,
         agent_private_key="0x" + "a" * 64,
         main_wallet_address="0x" + "b" * 40,
-        max_notional_per_trade=50.0,  # very low cap
+        max_notional_per_trade=50.0,  # cap = $50
     )
     mgr = HyperliquidOrderManager(StrategyConfig(), live_cfg, coin="BTC")
-    sig = _signal()  # qty=1.0, entry=100.0 -> notional=$100
-    with pytest.raises(RuntimeError, match="max_notional"):
-        mgr.submit_entry(sig, signal_id="abc", qty=1.0, risk_dollars=1.0)
+    mgr._sz_decimals = 5  # BTC precision (avoid network meta lookup)
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 999}}]}},
+    }
+    mgr._exchange = fake_exchange
+
+    sig = _signal()  # entry=100.0
+    # qty=1.0 -> desired notional=$100 (over $50 cap). Clamp to qty=0.5
+    # -> notional=$50 (matches cap). After lot rounding (5 decimals): 0.5 unchanged.
+    update = mgr.submit_entry(sig, signal_id="clamp_me", qty=1.0, risk_dollars=1.0)
+
+    assert update.event_type == ExecEventType.ENTRY_PLACED
+    assert "CLAMPED" in update.message
+    # The order actually sent had qty=0.5 (clamped to fit $50 cap)
+    sent_qty = fake_exchange.order.call_args.kwargs["sz"]
+    assert sent_qty == pytest.approx(0.5, abs=1e-6)
+    # Pending entry reflects clamped qty
+    assert mgr.pending_entry.qty == pytest.approx(0.5, abs=1e-6)
+
+
+def test_rejects_when_clamped_qty_below_hl_min_notional():
+    """If the cap is so tight that clamping produces a sub-$10 order, emit
+    ENTRY_REJECTED instead of placing a doomed order."""
+    live_cfg = LiveConfig(
+        allow_live=True,
+        agent_private_key="0x" + "a" * 64,
+        main_wallet_address="0x" + "b" * 40,
+        max_notional_per_trade=5.0,  # below HL's $10 platform minimum
+    )
+    mgr = HyperliquidOrderManager(StrategyConfig(), live_cfg, coin="BTC")
+    mgr._sz_decimals = 5
+    fake_exchange = MagicMock()
+    mgr._exchange = fake_exchange
+
+    sig = _signal()
+    update = mgr.submit_entry(sig, signal_id="too_small", qty=1.0, risk_dollars=1.0)
+
+    assert update.event_type == ExecEventType.ENTRY_REJECTED
+    assert "below_hl_min_notional" in update.message
+    # No order placed
+    fake_exchange.order.assert_not_called()
+    # No pending entry recorded
+    assert mgr.pending_entry is None
+
+
+def test_rejects_when_qty_rounds_to_zero():
+    """If the lot-rounded qty is zero (qty < lot), emit ENTRY_REJECTED."""
+    live_cfg = LiveConfig(
+        allow_live=True,
+        agent_private_key="0x" + "a" * 64,
+        main_wallet_address="0x" + "b" * 40,
+        max_notional_per_trade=10000.0,
+    )
+    mgr = HyperliquidOrderManager(StrategyConfig(), live_cfg, coin="SOL")
+    mgr._sz_decimals = 2  # SOL: lot = 0.01
+    fake_exchange = MagicMock()
+    mgr._exchange = fake_exchange
+
+    sig = _signal()  # entry=100.0
+    # qty=0.005 < SOL lot 0.01 -> rounds down to 0
+    update = mgr.submit_entry(sig, signal_id="sub_lot", qty=0.005, risk_dollars=1.0)
+
+    assert update.event_type == ExecEventType.ENTRY_REJECTED
+    assert "below_hl_min_lot" in update.message or "below_hl_min_notional" in update.message
+    fake_exchange.order.assert_not_called()
+
+
+def _signal_at_price(entry: float, stop: float, tp1: float, tp2: float) -> SweepSignal:
+    """Helper for tests that need realistic price levels (BTC/ETH-scale)."""
+    return SweepSignal(
+        side=Side.LONG, level=entry, level_label="prior_15m_low",
+        sweep_extreme=stop, entry_price=entry, stop_price=stop,
+        tp1_price=tp1, tp2_price=tp2, confidence=0.9, reason="test", created_ms=1_000,
+    )
+
+
+def test_qty_rounded_down_to_coin_lot_size_btc():
+    """BTC szDecimals=5 -> lot 0.00001. Sub-precision qty is rounded DOWN.
+    Uses entry=$80,000 so a tiny lot-precision qty still clears $10 min notional."""
+    live_cfg = LiveConfig(
+        allow_live=True, agent_private_key="0x" + "a" * 64,
+        main_wallet_address="0x" + "b" * 40, max_notional_per_trade=10000.0,
+    )
+    mgr = HyperliquidOrderManager(StrategyConfig(), live_cfg, coin="BTC")
+    mgr._sz_decimals = 5
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 1}}]}},
+    }
+    mgr._exchange = fake_exchange
+
+    sig = _signal_at_price(entry=80000.0, stop=79800.0, tp1=80400.0, tp2=80800.0)
+    # qty=0.000234567 -> rounded down to 0.00023 (5 decimals, floored).
+    # notional = 80000 * 0.00023 = $18.40 (above $10 min).
+    update = mgr.submit_entry(sig, signal_id="round_btc", qty=0.000234567, risk_dollars=1.0)
+
+    assert update.event_type == ExecEventType.ENTRY_PLACED, update.message
+    sent_qty = fake_exchange.order.call_args.kwargs["sz"]
+    assert sent_qty == pytest.approx(0.00023, abs=1e-7)
+
+
+def test_qty_rounded_down_to_coin_lot_size_eth():
+    """ETH szDecimals=4 -> lot 0.0001."""
+    live_cfg = LiveConfig(
+        allow_live=True, agent_private_key="0x" + "a" * 64,
+        main_wallet_address="0x" + "b" * 40, max_notional_per_trade=10000.0,
+    )
+    mgr = HyperliquidOrderManager(StrategyConfig(), live_cfg, coin="ETH")
+    mgr._sz_decimals = 4
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 2}}]}},
+    }
+    mgr._exchange = fake_exchange
+
+    sig = _signal_at_price(entry=2300.0, stop=2293.0, tp1=2310.0, tp2=2320.0)
+    # qty=0.012345 -> rounded down to 0.0123 (4 decimals).
+    # notional = 2300 * 0.0123 = $28.29 (above $10 min).
+    update = mgr.submit_entry(sig, signal_id="round_eth", qty=0.012345, risk_dollars=1.0)
+
+    assert update.event_type == ExecEventType.ENTRY_PLACED, update.message
+    sent_qty = fake_exchange.order.call_args.kwargs["sz"]
+    assert sent_qty == pytest.approx(0.0123, abs=1e-6)
+
+
+def test_clamp_recomputes_risk_dollars_proportionally():
+    """When qty is clamped down, effective risk_dollars must shrink to match.
+
+    Otherwise journal r-multiples are deflated (denominator stays at the
+    original budget while numerator shrinks with the clamped qty), making
+    every clamped trade look 1/N as good as it really is.
+    """
+    live_cfg = LiveConfig(
+        allow_live=True, agent_private_key="0x" + "a" * 64,
+        main_wallet_address="0x" + "b" * 40, max_notional_per_trade=50.0,
+    )
+    mgr = HyperliquidOrderManager(StrategyConfig(), live_cfg, coin="BTC")
+    mgr._sz_decimals = 5
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 7}}]}},
+    }
+    mgr._exchange = fake_exchange
+
+    # entry=100, stop=99 -> stop_distance=1. qty=1.0 (intended) -> intended risk=$1.
+    # Clamp halves qty to 0.5 -> actual risk = 0.5 * 1 = $0.50.
+    sig = _signal()
+    update = mgr.submit_entry(sig, signal_id="r_calc", qty=1.0, risk_dollars=1.0)
+    assert update.event_type == ExecEventType.ENTRY_PLACED
+    # PendingEntry's risk_dollars must reflect the smaller post-clamp reality
+    assert mgr.pending_entry.risk_dollars == pytest.approx(0.5, abs=1e-6)
+
+
+def test_refuses_when_notional_exceeds_cap_legacy_remains_off():
+    """Sanity: the cap clamp behavior is the only mode now. We do NOT raise
+    on over-cap qty (that was the old behavior, which silently dropped signals)."""
+    live_cfg = LiveConfig(
+        allow_live=True, agent_private_key="0x" + "a" * 64,
+        main_wallet_address="0x" + "b" * 40, max_notional_per_trade=50.0,
+    )
+    mgr = HyperliquidOrderManager(StrategyConfig(), live_cfg, coin="BTC")
+    mgr._sz_decimals = 5
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 1}}]}},
+    }
+    mgr._exchange = fake_exchange
+
+    sig = _signal()
+    # Must NOT raise — must place a clamped order or emit ENTRY_REJECTED
+    update = mgr.submit_entry(sig, signal_id="x", qty=10.0, risk_dollars=1.0)
+    assert update.event_type in (ExecEventType.ENTRY_PLACED, ExecEventType.ENTRY_REJECTED)
 
 
 def _live_cfg():
@@ -75,7 +256,7 @@ def test_submit_entry_places_post_only_limit(monkeypatch):
     mgr._exchange = fake_exchange  # inject mock
 
     sig = _signal()
-    update = mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    update = mgr.submit_entry(sig, signal_id="abc", qty=0.2, risk_dollars=1.0)
 
     assert update.event_type == ExecEventType.ENTRY_PLACED
     assert update.signal_id == "abc"
@@ -92,11 +273,11 @@ def test_submit_entry_places_post_only_limit(monkeypatch):
         order_type = args[4]
     assert order_type == {"limit": {"tif": "Alo"}}
     assert kwargs.get("limit_px") == 100.0
-    assert kwargs.get("sz") == 0.001
+    assert kwargs.get("sz") == pytest.approx(0.2, abs=1e-9)
     assert kwargs.get("reduce_only") is False
     # Pending entry was recorded
     assert mgr.pending_entry is not None
-    assert mgr.pending_entry.qty == 0.001
+    assert mgr.pending_entry.qty == pytest.approx(0.2, abs=1e-9)
     # pending_entry now also has external_oid
     assert mgr.pending_entry.external_oid == 12345
 
@@ -109,7 +290,7 @@ def test_submit_entry_raises_on_network_error():
     mgr._exchange = fake_exchange
     sig = _signal()
     with pytest.raises(RuntimeError, match="HL order"):
-        mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+        mgr.submit_entry(sig, signal_id="abc", qty=0.2, risk_dollars=1.0)
     # Pending entry should NOT be set after a failed submission
     assert mgr.pending_entry is None
 
@@ -126,7 +307,7 @@ def test_pending_entry_cancels_on_expiry():
     mgr._info = MagicMock()  # prevent real HTTP calls during _maybe_detect_fill
 
     sig = _signal()
-    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    mgr.submit_entry(sig, signal_id="abc", qty=0.2, risk_dollars=1.0)
     assert mgr.pending_entry is not None
 
     expired_ms = sig.created_ms + (200 * 1000)
@@ -155,7 +336,7 @@ def test_pending_entry_does_not_cancel_before_expiry():
     mgr._info = MagicMock()  # prevent real HTTP calls during _maybe_detect_fill
 
     sig = _signal()
-    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    mgr.submit_entry(sig, signal_id="abc", qty=0.2, risk_dollars=1.0)
     updates = mgr.on_trade(TradeEvent(ts_ms=sig.created_ms + 60_000, price=100.5, size=1.0))
     assert mgr.pending_entry is not None
     fake_exchange.cancel_by_cloid.assert_not_called()
@@ -175,7 +356,7 @@ def test_pending_entry_clears_state_even_when_cancel_fails():
     mgr._info = MagicMock()  # prevent real HTTP calls during _maybe_detect_fill
 
     sig = _signal()
-    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    mgr.submit_entry(sig, signal_id="abc", qty=0.2, risk_dollars=1.0)
     expired_ms = sig.created_ms + (200 * 1000)
     updates = mgr.on_trade(TradeEvent(ts_ms=expired_ms, price=100.5, size=1.0))
 
@@ -198,13 +379,13 @@ def test_pending_entry_transitions_to_position_on_fill(monkeypatch):
     # First call: empty positions. Second: BTC long open at 100.0 size 0.001.
     fake_info.user_state.side_effect = [
         {"assetPositions": []},
-        {"assetPositions": [{"position": {"coin": "BTC", "szi": "0.001", "entryPx": "100.0"}}]},
+        {"assetPositions": [{"position": {"coin": "BTC", "szi": "0.2", "entryPx": "100.0"}}]},
     ]
     mgr._exchange = fake_exchange
     mgr._info = fake_info
 
     sig = _signal()
-    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    mgr.submit_entry(sig, signal_id="abc", qty=0.2, risk_dollars=1.0)
 
     # First tick: not yet filled
     out1 = mgr.on_trade(TradeEvent(ts_ms=sig.created_ms + 500, price=100.0, size=1.0))
@@ -215,7 +396,7 @@ def test_pending_entry_transitions_to_position_on_fill(monkeypatch):
     out2 = mgr.on_trade(TradeEvent(ts_ms=sig.created_ms + 1500, price=100.0, size=1.0))
     assert mgr.position is not None
     assert mgr.position.entry_price == 100.0
-    assert mgr.position.qty_initial == 0.001
+    assert mgr.position.qty_initial == pytest.approx(0.2, abs=1e-9)
     assert mgr.pending_entry is None
     assert any(u.event_type == ExecEventType.ENTRY_FILLED for u in out2)
 
@@ -231,17 +412,17 @@ def test_fill_detection_handles_szi_dict_format():
     fake_info = MagicMock()
     fake_info.user_state.return_value = {
         "assetPositions": [{
-            "position": {"coin": "BTC", "szi": {"base": "0.001", "quote": "0.1"}, "entryPx": "100.0"},
+            "position": {"coin": "BTC", "szi": {"base": "0.2", "quote": "0.1"}, "entryPx": "100.0"},
         }],
     }
     mgr._exchange = fake_exchange
     mgr._info = fake_info
 
     sig = _signal()
-    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    mgr.submit_entry(sig, signal_id="abc", qty=0.2, risk_dollars=1.0)
     mgr.on_trade(TradeEvent(ts_ms=sig.created_ms + 500, price=100.0, size=1.0))
     assert mgr.position is not None
-    assert mgr.position.qty_initial == 0.001
+    assert mgr.position.qty_initial == pytest.approx(0.2, abs=1e-9)
 
 
 def test_fill_detection_ignores_other_coins():
@@ -263,7 +444,7 @@ def test_fill_detection_ignores_other_coins():
     mgr._info = fake_info
 
     sig = _signal()
-    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    mgr.submit_entry(sig, signal_id="abc", qty=0.2, risk_dollars=1.0)
     out = mgr.on_trade(TradeEvent(ts_ms=sig.created_ms + 500, price=100.0, size=1.0))
     # No matching BTC position -> no transition
     assert mgr.position is None
@@ -281,13 +462,13 @@ def test_fill_detected_when_expiry_cancel_races_fill():
     }
     fake_info = MagicMock()
     fake_info.user_state.return_value = {
-        "assetPositions": [{"position": {"coin": "BTC", "szi": "0.001", "entryPx": "100.0"}}],
+        "assetPositions": [{"position": {"coin": "BTC", "szi": "0.2", "entryPx": "100.0"}}],
     }
     mgr._exchange = fake_exchange
     mgr._info = fake_info
 
     sig = _signal()
-    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    mgr.submit_entry(sig, signal_id="abc", qty=0.2, risk_dollars=1.0)
     # Tick well past expiry — but HL says we're filled
     expired_ms = sig.created_ms + (200 * 1000)
     updates = mgr.on_trade(TradeEvent(ts_ms=expired_ms, price=100.5, size=1.0))
@@ -309,13 +490,13 @@ def test_fill_detection_rejects_opposite_side_position():
     }
     fake_info = MagicMock()
     fake_info.user_state.return_value = {
-        "assetPositions": [{"position": {"coin": "BTC", "szi": "-0.001", "entryPx": "100.0"}}],
+        "assetPositions": [{"position": {"coin": "BTC", "szi": "-0.2", "entryPx": "100.0"}}],
     }
     mgr._exchange = fake_exchange
     mgr._info = fake_info
 
     sig = _signal()  # LONG signal
-    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    mgr.submit_entry(sig, signal_id="abc", qty=0.2, risk_dollars=1.0)
     out = mgr.on_trade(TradeEvent(ts_ms=sig.created_ms + 1500, price=100.0, size=1.0))
     # Wrong-side szi should NOT trigger fill
     assert mgr.position is None
@@ -336,7 +517,7 @@ def test_fill_polling_rate_limited_to_1_per_second():
     mgr._info = fake_info
 
     sig = _signal()
-    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    mgr.submit_entry(sig, signal_id="abc", qty=0.2, risk_dollars=1.0)
     # 5 ticks in 500ms -> only 1 poll
     base = sig.created_ms + 1000
     for offset in (0, 100, 200, 300, 400):
@@ -415,8 +596,10 @@ def test_short_stop_loss_triggers_when_price_above_stop():
 
 
 def test_entry_fee_recorded_on_live_fill():
-    """Live fills must record the maker entry fee (rebate) just like paper does."""
+    """Live fills must record the maker entry fee just like paper does. With
+    retail-tier defaults (maker = +0.015%), this is a small positive fee paid."""
     mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    mgr._sz_decimals = 5
     fake_exchange = MagicMock()
     fake_exchange.order.return_value = {
         "status": "ok",
@@ -424,16 +607,17 @@ def test_entry_fee_recorded_on_live_fill():
     }
     fake_info = MagicMock()
     fake_info.user_state.return_value = {
-        "assetPositions": [{"position": {"coin": "BTC", "szi": "0.001", "entryPx": "100.0"}}],
+        "assetPositions": [{"position": {"coin": "BTC", "szi": "0.2", "entryPx": "100.0"}}],
     }
     mgr._exchange = fake_exchange
     mgr._info = fake_info
     sig = _signal()
-    mgr.submit_entry(sig, signal_id="abc", qty=0.001, risk_dollars=1.0)
+    mgr.submit_entry(sig, signal_id="abc", qty=0.2, risk_dollars=1.0)
     mgr.on_trade(TradeEvent(ts_ms=sig.created_ms + 1500, price=100.0, size=1.0))
-    # entry_fee should be entry_px * qty * maker_fee_pct = 100.0 * 0.001 * -0.00015 = -1.5e-5
-    expected = 100.0 * 0.001 * StrategyConfig().maker_fee_pct
-    assert abs(mgr.position.realized_fees - expected) < 1e-12
+    # entry_fee = entry_px * qty * maker_fee_pct = 100.0 * 0.2 * +0.00015 = +0.003
+    expected = 100.0 * 0.2 * StrategyConfig().maker_fee_pct
+    assert mgr.position is not None, "Fill should have been detected with szi >= 50% of qty"
+    assert abs(mgr.position.realized_fees - expected) < 1e-9
 
 
 def test_market_close_none_result_clears_state_with_phantom_close():
@@ -801,7 +985,7 @@ def test_reconcile_uses_wall_clock_for_opened_ms(monkeypatch):
     mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
     fake_info = MagicMock()
     fake_info.user_state.return_value = {
-        "assetPositions": [{"position": {"coin": "BTC", "szi": "0.001", "entryPx": "100.0"}}],
+        "assetPositions": [{"position": {"coin": "BTC", "szi": "0.2", "entryPx": "100.0"}}],
     }
     fake_info.open_orders.return_value = []
     mgr._info = fake_info
