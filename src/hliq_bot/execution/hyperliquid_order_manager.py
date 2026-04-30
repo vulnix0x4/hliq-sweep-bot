@@ -108,6 +108,24 @@ class HyperliquidOrderManager:
         # Floor in integer space to avoid float rounding wobble at the lot boundary.
         return int(qty * multiplier) / multiplier
 
+    def _round_px(self, price: float) -> float:
+        """Round a price to HL's wire-compatible tick.
+
+        HL price quantization rules (verified empirically — observed
+        'float_to_wire causes rounding' SDK error on ETH 2244.5857142857144):
+          - Max 5 significant figures
+          - Max (6 - szDecimals) decimal places
+          - Both rules apply; the more restrictive one wins.
+
+        For our perp universe (BTC szDecimals=5, ETH=4, SOL=2), the 5-sig-fig
+        rule is the binding constraint at typical price levels. Python's
+        `:.5g` general format implements 5 sig figs cleanly and rounds to
+        the nearest representable value, which is what HL expects on the wire.
+        """
+        if price <= 0:
+            return price
+        return float(f"{price:.5g}")
+
     def submit_entry(
         self,
         signal: SweepSignal,
@@ -117,16 +135,24 @@ class HyperliquidOrderManager:
     ) -> ExecutionUpdate:
         self._guard_live()
 
+        # Step 0: Round entry price to HL's wire-compatible tick FIRST. The
+        # SDK's float_to_wire rejects high-precision floats; strategy-derived
+        # prices (level offsets, VWAP-relative entries) often have many
+        # decimals. Round once up-front and use rounded_px everywhere
+        # downstream so the cap-clamp / notional / risk math all match what
+        # HL will actually fill at.
+        rounded_px = self._round_px(signal.entry_price)
+
         # Step 1: Clamp qty to fit max_notional_per_trade. This replaces the
         # earlier "raise on over-cap" behavior, which silently dropped every
         # signal whose risk-based qty produced a notional above the cap (every
         # signal at small accounts with normal stops). We clamp instead and
         # journal the clamp event so operators can see what's happening.
         cap = self.live_cfg.max_notional_per_trade
-        desired_notional = signal.entry_price * qty
+        desired_notional = rounded_px * qty
         clamped = False
         if desired_notional > cap:
-            qty = cap / signal.entry_price
+            qty = cap / rounded_px
             clamped = True
 
         # Step 2: Round qty DOWN to the coin's lot size. ETH (lot 0.0001),
@@ -137,7 +163,7 @@ class HyperliquidOrderManager:
         # platform-wide $10 minimum notional, OR rounded to zero (qty < lot).
         # Either way we cannot place: emit ENTRY_REJECTED so bot._maybe_open
         # can journal the reason and increment the per-reason block counter.
-        notional = signal.entry_price * qty
+        notional = rounded_px * qty
         if qty <= 0 or notional < HL_MIN_ORDER_NOTIONAL:
             reason = (
                 "below_hl_min_lot" if qty <= 0
@@ -150,7 +176,7 @@ class HyperliquidOrderManager:
                     f"hl entry rejected ({reason}): qty={qty:.8f} "
                     f"notional=${notional:.2f} cap=${cap:.2f} "
                     f"min_notional=${HL_MIN_ORDER_NOTIONAL:.2f} "
-                    f"side={signal.side.value} px={signal.entry_price:.2f}"
+                    f"side={signal.side.value} px={rounded_px:.4f}"
                     + (" CLAMPED" if clamped else "")
                 ),
                 signal_id=signal_id,
@@ -160,7 +186,7 @@ class HyperliquidOrderManager:
         # to the actual qty. The caller passed the INTENDED risk budget, but
         # if we clamped, the realized risk is smaller. This keeps r-multiples
         # honest in the journal (small qty -> small risk -> realistic R).
-        actual_risk = abs(signal.entry_price - signal.stop_price) * qty
+        actual_risk = abs(rounded_px - signal.stop_price) * qty
         # Use the smaller of (intended, actual) so we never inflate R.
         effective_risk = min(risk_dollars, actual_risk) if actual_risk > 0 else risk_dollars
 
@@ -173,7 +199,7 @@ class HyperliquidOrderManager:
                 name=self.coin,
                 is_buy=is_buy,
                 sz=qty,
-                limit_px=signal.entry_price,
+                limit_px=rounded_px,
                 order_type={"limit": {"tif": "Alo"}},
                 reduce_only=False,
                 cloid=cloid,
@@ -184,7 +210,7 @@ class HyperliquidOrderManager:
             # uncaught exception that leaves pending_entry=None silently.
             raise RuntimeError(
                 f"HL order submission failed for signal_id={signal_id} "
-                f"side={signal.side.value} qty={qty} px={signal.entry_price}: {exc}"
+                f"side={signal.side.value} qty={qty} px={rounded_px}: {exc}"
             ) from exc
         if result.get("status") != "ok":
             raise RuntimeError(f"HL order failed: {result}")
@@ -205,7 +231,7 @@ class HyperliquidOrderManager:
             signal_id=signal_id,
             side=signal.side,
             qty=qty,
-            entry_price=signal.entry_price,
+            entry_price=rounded_px,  # use HL-tick-rounded price so fill detection matches
             stop_price=signal.stop_price,
             tp1_price=signal.tp1_price,
             tp2_price=signal.tp2_price,
@@ -225,7 +251,7 @@ class HyperliquidOrderManager:
             event_type=ExecEventType.ENTRY_PLACED,
             message=(
                 f"hl entry placed [{self.live_cfg.network}]: {signal.side.value} "
-                f"qty={qty:.8f} @ {signal.entry_price:.2f} notional=${notional:.2f} "
+                f"qty={qty:.8f} @ {rounded_px:.4f} notional=${notional:.2f} "
                 f"oid={oid}{clamp_msg}"
             ),
             signal_id=signal_id,
