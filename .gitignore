@@ -18,3 +18,4 @@ runtime/
 .idea/
 .vscode/
 .testnet_main_wallet.txt
+.env.backup_*
