@@ -126,6 +126,62 @@ def test_rejects_when_qty_rounds_to_zero():
     fake_exchange.order.assert_not_called()
 
 
+def test_round_px_5sig_figs():
+    """HL price quantization: max 5 sig figs. Confirmed via SDK error
+    'float_to_wire causes rounding' on ETH 2244.5857142857144."""
+    live_cfg = LiveConfig(allow_live=True, agent_private_key="0x" + "a" * 64,
+                          main_wallet_address="0x" + "b" * 40)
+    mgr = HyperliquidOrderManager(StrategyConfig(), live_cfg, coin="ETH")
+
+    # ETH at $2244.5857... → 5 sig figs → 2244.6
+    assert mgr._round_px(2244.5857142857144) == pytest.approx(2244.6, abs=1e-9)
+    # Already-precise value stays
+    assert mgr._round_px(2244.5) == pytest.approx(2244.5, abs=1e-9)
+    # BTC large value → 5 sig figs → integer (banker's rounding on .50 → even)
+    assert mgr._round_px(76332.51) == pytest.approx(76333.0, abs=1e-9)
+    assert mgr._round_px(76332.49) == pytest.approx(76332.0, abs=1e-9)
+    # SOL small value → 5 sig figs → 4 decimals OK
+    assert mgr._round_px(83.70153) == pytest.approx(83.702, abs=1e-9)
+    # Whole-dollar value passes through
+    assert mgr._round_px(100.0) == pytest.approx(100.0, abs=1e-9)
+    # Very small (e.g. some token under $1)
+    assert mgr._round_px(0.012345678) == pytest.approx(0.012346, abs=1e-9)
+    # Zero / negative → unchanged (defensive, shouldn't happen in practice)
+    assert mgr._round_px(0.0) == 0.0
+    assert mgr._round_px(-1.0) == -1.0
+
+
+def test_submit_entry_rounds_high_precision_price():
+    """The price 2244.5857142857144 must NOT reach the SDK — it must be
+    rounded to 2244.6 before exchange.order is called. Regression for the
+    'float_to_wire causes rounding' bug observed live 2026-04-30 03:16."""
+    live_cfg = LiveConfig(
+        allow_live=True, agent_private_key="0x" + "a" * 64,
+        main_wallet_address="0x" + "b" * 40, max_notional_per_trade=10000.0,
+    )
+    mgr = HyperliquidOrderManager(StrategyConfig(), live_cfg, coin="ETH")
+    mgr._sz_decimals = 4
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 999}}]}},
+    }
+    mgr._exchange = fake_exchange
+
+    sig = _signal_at_price(
+        entry=2244.5857142857144,  # the actual live-bug price
+        stop=2238.41, tp1=2252.78, tp2=2263.99,
+    )
+    update = mgr.submit_entry(sig, signal_id="precision_bug", qty=0.05, risk_dollars=1.0)
+
+    assert update.event_type == ExecEventType.ENTRY_PLACED
+    # Verify the SDK got the rounded price, not the raw one
+    sent_px = fake_exchange.order.call_args.kwargs["limit_px"]
+    assert sent_px == pytest.approx(2244.6, abs=1e-9)
+    # Pending entry stores rounded price too (so fill detection compares correctly)
+    assert mgr.pending_entry.entry_price == pytest.approx(2244.6, abs=1e-9)
+
+
 def _signal_at_price(entry: float, stop: float, tp1: float, tp2: float) -> SweepSignal:
     """Helper for tests that need realistic price levels (BTC/ETH-scale)."""
     return SweepSignal(
