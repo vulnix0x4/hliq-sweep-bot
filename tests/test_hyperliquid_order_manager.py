@@ -698,10 +698,14 @@ def test_market_close_none_result_clears_state_with_phantom_close():
     assert "phantom_close" in closed_events[0].message
 
 
-def test_market_close_avg_px_fallback_uses_trade_price():
-    """If HL response is malformed, fall back to the trigger trade.price (not entry_price).
-    This avoids understating the loss on a stop-out from a fast move."""
+def test_malformed_close_response_keeps_position_open(tmp_path):
+    """REGRESSION (bug observed live 2026-05-04): if the SDK returns status=ok
+    but no "filled" status, the bot must NOT clear local state. The previous
+    behavior fell through with fill_px=trade.price and orphaned the position
+    on HL. Now the bot logs CRITICAL and retains state for retry."""
     mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "BTC.json"
     fake_exchange = MagicMock()
     fake_exchange.market_close.return_value = {
         "status": "ok",
@@ -715,13 +719,12 @@ def test_market_close_avg_px_fallback_uses_trade_price():
         opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
         risk_dollars=1.0, coin="BTC", best_price=100.0, worst_price=100.0,
     )
-    # Stop triggered at 98.5 (worse than stop_price=99.0)
     updates = mgr.on_trade(TradeEvent(ts_ms=2000, price=98.5, size=1.0))
-    closed = [u for u in updates if u.closed_trade is not None][0].closed_trade
-    # Should record exit_price=98.5 (trade.price), not 100.0 (entry_price)
-    assert closed.exit_price == 98.5
-    # pnl_gross should reflect the actual loss: (98.5 - 100.0) * 0.001 = -0.0015
-    assert abs(closed.pnl_gross - (-0.0015)) < 1e-9
+    # Position must still be set (no orphan)
+    assert mgr.position is not None
+    # No POSITION_CLOSED event
+    closed_events = [u for u in updates if u.closed_trade is not None]
+    assert len(closed_events) == 0
 
 
 def test_tp1_partial_close_at_target():
@@ -808,21 +811,26 @@ def test_short_tp1_fires_when_price_below_target():
     assert any(u.event_type == ExecEventType.PARTIAL_TP for u in updates)
 
 
-def test_tp2_triggers_full_close():
-    """When price hits tp2 and qty remains, close all via market_close."""
+def test_tp2_triggers_full_close(tmp_path):
+    """When price hits tp2 with no remaining TP1 partial to do, close all via
+    market_close. Pre-marks tp1_filled=True so only TP2 logic fires this tick
+    (otherwise both fire and partial-fill mock semantics get tangled)."""
     mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "BTC.json"
     fake_exchange = MagicMock()
     fake_exchange.market_close.return_value = {
         "status": "ok",
-        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.001", "avgPx": "104.0"}}]}},
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.0005", "avgPx": "104.0"}}]}},
     }
     mgr._exchange = fake_exchange
     from hliq_bot.models import OpenPosition
     mgr.position = OpenPosition(
         signal_id="abc", side=Side.LONG, entry_price=100.0,
-        stop_price=99.0, tp1_price=102.0, tp2_price=104.0,
-        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        stop_price=100.0, tp1_price=102.0, tp2_price=104.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.0005,  # half remaining post-TP1
         risk_dollars=1.0, coin="BTC", best_price=100.0, worst_price=100.0,
+        tp1_filled=True,  # TP1 already done
     )
     updates = mgr.on_trade(TradeEvent(ts_ms=2000, price=104.5, size=1.0))
     fake_exchange.market_close.assert_called()
@@ -855,7 +863,7 @@ def test_max_hold_triggers_after_max_holding_sec():
     assert closed.exit_reason == "max_hold"
 
 
-def test_early_exit_triggers_when_deeply_negative():
+def test_early_exit_triggers_when_deeply_negative(tmp_path):
     cfg = StrategyConfig(
         early_exit_sec=120,
         early_exit_r_threshold=-0.5,
@@ -863,10 +871,13 @@ def test_early_exit_triggers_when_deeply_negative():
         time_stop_sec=600,
     )
     mgr = HyperliquidOrderManager(cfg, _live_cfg(), coin="BTC")
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "BTC.json"
     fake_exchange = MagicMock()
+    # Match the position's qty (1.0) so this is a full-fill close, not partial.
     fake_exchange.market_close.return_value = {
         "status": "ok",
-        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.001", "avgPx": "99.5"}}]}},
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "1.0", "avgPx": "99.5"}}]}},
     }
     mgr._exchange = fake_exchange
     from hliq_bot.models import OpenPosition
@@ -958,9 +969,12 @@ def test_post_tp1_trail_uses_trail_factor():
     assert abs(mgr.position.stop_price - 101.5) < 1e-9
 
 
-def test_reconciles_existing_long_position_on_startup():
-    """If HL has an existing LONG position, reconstruct OpenPosition with conservative wide stop."""
+def test_reconciles_existing_long_position_on_startup(tmp_path):
+    """If HL has an existing LONG position and no persisted state, reconstruct
+    OpenPosition with the tightened 0.5% wide-stop fallback (down from 2%)."""
     mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "BTC.json"  # no file → wide-stop fallback
     fake_info = MagicMock()
     fake_info.user_state.return_value = {
         "assetPositions": [{
@@ -974,15 +988,17 @@ def test_reconciles_existing_long_position_on_startup():
     assert mgr.position.qty_initial == 0.005
     assert mgr.position.entry_price == 100.0
     assert mgr.position.side == Side.LONG
-    # Wide conservative stop: -2% from entry for LONG
-    assert abs(mgr.position.stop_price - 98.0) < 0.01
+    # Tightened wide stop: -0.5% from entry for LONG (was -2%)
+    assert abs(mgr.position.stop_price - 99.5) < 0.01
     # TP1/TP2 disabled (set to entry so they never fire)
     assert mgr.position.tp1_price == 100.0
     assert mgr.position.tp2_price == 100.0
 
 
-def test_reconciles_existing_short_position_on_startup():
+def test_reconciles_existing_short_position_on_startup(tmp_path):
     mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "BTC.json"
     fake_info = MagicMock()
     fake_info.user_state.return_value = {
         "assetPositions": [{
@@ -995,8 +1011,8 @@ def test_reconciles_existing_short_position_on_startup():
     assert mgr.position is not None
     assert mgr.position.side == Side.SHORT
     assert mgr.position.qty_initial == 0.005
-    # Wide conservative stop: +2% from entry for SHORT
-    assert abs(mgr.position.stop_price - 102.0) < 0.01
+    # Tightened wide stop: +0.5% from entry for SHORT
+    assert abs(mgr.position.stop_price - 100.5) < 0.01
 
 
 def test_reconcile_no_op_when_no_position():
@@ -1150,3 +1166,258 @@ def test_refresh_deadman_swallows_sdk_failure():
     mgr._exchange = fake_exchange
     # Should not raise
     mgr.refresh_deadman(now_ms=1_000_000_000_000)
+
+
+# ============================================================================
+# Phantom-close-in-reverse regression tests (bug observed live 2026-05-04)
+# ============================================================================
+# Failure mode: market_close returns status=ok but with no "filled" key in
+# statuses, the bot used to fall through with fill_px=trade_price and clear
+# local position state. HL kept the position open as an unmanaged orphan.
+# These tests assert the new behavior: do NOT clear local state when the SDK
+# response doesn't confirm a fill.
+
+
+def _open_position(mgr, qty=0.013, entry=2280.0, stop=2275.0):
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="t1", side=Side.LONG, entry_price=entry, stop_price=stop,
+        tp1_price=entry + 10, tp2_price=entry + 20, opened_ms=1_000_000,
+        qty_initial=qty, qty_remaining=qty, risk_dollars=qty * (entry - stop),
+        coin="ETH", best_price=entry, worst_price=entry,
+    )
+
+
+def test_close_via_market_keeps_position_when_response_has_no_filled(tmp_path):
+    """Regression: market_close returns status=ok with empty/error statuses → do NOT clear state."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="ETH")
+    mgr._sz_decimals = 4
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "ETH.json"
+    fake_exchange = MagicMock()
+    # SDK returns ok-shaped response but with no "filled" status (e.g. error in statuses)
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"error": "Reduce only failed"}]}},
+    }
+    mgr._exchange = fake_exchange
+    _open_position(mgr)
+    # Trigger stop_loss (price below stop)
+    updates = mgr.on_trade(TradeEvent(ts_ms=2_000_000, price=2270.0, size=1.0))
+    # CRITICAL: position must remain set so the next tick will retry
+    assert mgr.position is not None, "position cleared despite no fill confirmation — orphan risk"
+    # No POSITION_CLOSED event emitted
+    closed_events = [u for u in updates if u.event_type == ExecEventType.POSITION_CLOSED]
+    assert len(closed_events) == 0
+
+
+def test_close_via_market_keeps_position_when_statuses_empty(tmp_path):
+    """Same regression with empty statuses list."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="ETH")
+    mgr._sz_decimals = 4
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "ETH.json"
+    fake_exchange = MagicMock()
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": []}},
+    }
+    mgr._exchange = fake_exchange
+    _open_position(mgr)
+    mgr.on_trade(TradeEvent(ts_ms=2_000_000, price=2270.0, size=1.0))
+    assert mgr.position is not None
+
+
+def test_close_via_market_clears_position_when_filled_confirmed(tmp_path):
+    """Sanity: when filled status IS present, position clears normally."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="ETH")
+    mgr._sz_decimals = 4
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "ETH.json"
+    fake_exchange = MagicMock()
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.013", "avgPx": "2270.5"}}]}},
+    }
+    mgr._exchange = fake_exchange
+    _open_position(mgr)
+    updates = mgr.on_trade(TradeEvent(ts_ms=2_000_000, price=2270.0, size=1.0))
+    assert mgr.position is None
+    closed_events = [u for u in updates if u.event_type == ExecEventType.POSITION_CLOSED]
+    assert len(closed_events) == 1
+    assert closed_events[0].closed_trade.exit_reason == "stop_loss"
+
+
+def test_close_via_market_partial_fill_keeps_residual(tmp_path):
+    """When HL fills less than requested, the residual qty stays open for the next tick."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="ETH")
+    mgr._sz_decimals = 4
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "ETH.json"
+    fake_exchange = MagicMock()
+    # Requested 0.013, only 0.005 filled
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.005", "avgPx": "2270.5"}}]}},
+    }
+    mgr._exchange = fake_exchange
+    _open_position(mgr, qty=0.013)
+    updates = mgr.on_trade(TradeEvent(ts_ms=2_000_000, price=2270.0, size=1.0))
+    # Position must remain with residual (~0.008)
+    assert mgr.position is not None
+    assert mgr.position.qty_remaining == pytest.approx(0.008, abs=1e-6)
+    # Should emit a PARTIAL_TP event (not a full close)
+    partials = [u for u in updates if u.event_type == ExecEventType.PARTIAL_TP]
+    assert len(partials) == 1
+    assert "partial close" in partials[0].message.lower() or "qty=0.005" in partials[0].message
+
+
+def test_extract_fill_returns_none_for_non_filled_responses():
+    """The shared parser must return None for any non-filled response."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="ETH")
+    # None
+    assert mgr._extract_fill(None, default_px=100.0) is None
+    # Not a dict
+    assert mgr._extract_fill("ok", default_px=100.0) is None
+    # status != ok
+    assert mgr._extract_fill({"status": "err"}, default_px=100.0) is None
+    # Empty statuses
+    assert mgr._extract_fill({"status": "ok", "response": {"data": {"statuses": []}}}, default_px=100.0) is None
+    # No "filled" in status
+    assert mgr._extract_fill(
+        {"status": "ok", "response": {"data": {"statuses": [{"error": "x"}]}}},
+        default_px=100.0,
+    ) is None
+    # filled with 0 qty
+    assert mgr._extract_fill(
+        {"status": "ok", "response": {"data": {"statuses": [{"filled": {"totalSz": "0", "avgPx": "100"}}]}}},
+        default_px=100.0,
+    ) is None
+    # Valid filled response
+    qty_px = mgr._extract_fill(
+        {"status": "ok", "response": {"data": {"statuses": [{"filled": {"totalSz": "0.013", "avgPx": "2270.5"}}]}}},
+        default_px=100.0,
+    )
+    assert qty_px == (0.013, 2270.5)
+
+
+# ============================================================================
+# Position state persistence (daily-restart workaround)
+# ============================================================================
+
+
+def test_persist_position_writes_file_on_open(tmp_path):
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "BTC.json"
+    _open_position(mgr, entry=80000, stop=79800)
+    mgr._persist_position()
+    assert mgr._state_path.exists()
+    import json
+    data = json.loads(mgr._state_path.read_text())
+    assert data["coin"] == "BTC"
+    assert data["entry_price"] == 80000
+    assert data["stop_price"] == 79800
+    assert data["side"] == "long"
+    assert "ts_ms" in data
+
+
+def test_clear_persisted_state_removes_file(tmp_path):
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "BTC.json"
+    _open_position(mgr)
+    mgr._persist_position()
+    assert mgr._state_path.exists()
+    mgr.position = None
+    mgr._persist_position()  # should clear since position is None
+    assert not mgr._state_path.exists()
+
+
+def test_try_restore_from_persisted_when_fresh_and_matching(tmp_path):
+    """Persisted state matching HL position → restore exactly."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="ETH")
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "ETH.json"
+    _open_position(mgr, qty=0.013, entry=2280, stop=2275)
+    mgr.position.tp1_filled = True  # has been managed
+    mgr.position.realized_pnl = 0.05
+    mgr._persist_position()
+    saved_pos = mgr.position
+    mgr.position = None  # simulate restart
+    # HL still has matching position
+    hl_pos = {"szi": "0.013", "entryPx": "2280"}
+    restored = mgr._try_restore_from_persisted(hl_pos)
+    assert restored is True
+    assert mgr.position is not None
+    assert mgr.position.entry_price == 2280
+    assert mgr.position.stop_price == 2275
+    assert mgr.position.tp1_filled is True
+    assert mgr.position.realized_pnl == 0.05
+
+
+def test_try_restore_falls_through_when_state_stale(tmp_path):
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="ETH")
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "ETH.json"
+    # Manually write stale state (10 min old)
+    import json, time as tm
+    stale_ts = int(tm.time() * 1000) - 600_000  # 10 min ago
+    stale_data = {
+        "ts_ms": stale_ts, "coin": "ETH", "signal_id": "old", "side": "long",
+        "entry_price": 2280.0, "stop_price": 2275.0, "tp1_price": 2290.0, "tp2_price": 2300.0,
+        "qty_initial": 0.013, "qty_remaining": 0.013, "tp1_filled": False,
+        "best_price": 2280.0, "worst_price": 2280.0, "realized_pnl": 0.0,
+        "realized_fees": 0.004, "risk_dollars": 0.065, "opened_ms": stale_ts,
+    }
+    mgr._state_path.write_text(json.dumps(stale_data))
+    hl_pos = {"szi": "0.013", "entryPx": "2280"}
+    assert mgr._try_restore_from_persisted(hl_pos) is False
+    assert mgr.position is None
+
+
+def test_try_restore_falls_through_when_qty_mismatches_hl(tmp_path):
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="ETH")
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "ETH.json"
+    _open_position(mgr, qty=0.013)
+    mgr._persist_position()
+    mgr.position = None
+    # HL has different size
+    hl_pos = {"szi": "0.020", "entryPx": "2280"}
+    assert mgr._try_restore_from_persisted(hl_pos) is False
+    assert mgr.position is None
+
+
+def test_try_restore_falls_through_when_hl_has_no_position(tmp_path):
+    """Persisted state but HL has no position → clear stale file, fall through."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="ETH")
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "ETH.json"
+    _open_position(mgr)
+    mgr._persist_position()
+    mgr.position = None
+    assert mgr._try_restore_from_persisted(None) is False
+    # Stale file should be cleaned up
+    assert not mgr._state_path.exists()
+
+
+def test_persist_position_skips_redundant_writes(tmp_path):
+    """No filesystem write if state hasn't changed (avoids unnecessary IO every tick)."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "BTC.json"
+    _open_position(mgr)
+    mgr._persist_position()
+    mtime1 = mgr._state_path.stat().st_mtime_ns
+    import time as tm
+    tm.sleep(0.01)  # ensure mtime resolution
+    mgr._persist_position()  # nothing changed
+    mtime2 = mgr._state_path.stat().st_mtime_ns
+    assert mtime1 == mtime2  # not rewritten
+
+    # Now mutate state and persist again
+    mgr.position.stop_price = mgr.position.stop_price + 1.0
+    mgr._persist_position()
+    mtime3 = mgr._state_path.stat().st_mtime_ns
+    assert mtime3 > mtime2  # written this time

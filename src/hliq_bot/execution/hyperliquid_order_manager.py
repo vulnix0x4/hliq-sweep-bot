@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 from hyperliquid.utils import constants
@@ -23,6 +26,12 @@ log = logging.getLogger(__name__)
 
 # Hyperliquid platform-wide minimum order notional (verified via fees API + docs 2026-04-28).
 HL_MIN_ORDER_NOTIONAL = 10.0
+
+# Maximum age (seconds) for a persisted position-state file to be trusted on restart.
+# The host has a daily docker restart pattern around 11:02 UTC; warm-start usually
+# completes within 60s. 5 minutes leaves headroom for slower restarts while still
+# rejecting state from any restart that genuinely lost track of the position.
+PERSISTED_STATE_MAX_AGE_SEC = 300
 
 
 def _cloid_from_signal_id(signal_id: str):
@@ -74,6 +83,23 @@ class HyperliquidOrderManager:
         # HL meta cache — szDecimals per coin (lot precision). Loaded lazily.
         # Tests can set this directly to skip the network call.
         self._sz_decimals: int | None = None
+        # Position state persistence — works around host's daily docker restart
+        # pattern (~11:02 UTC). Bot writes full position state to this file on
+        # every on_trade tick; on restart, reconcile_on_startup loads from it
+        # before falling back to the wide-stop reconcile path. Tests can override
+        # the directory by setting state_dir env var or directly mutating
+        # _state_path. Defaults under runtime/active_positions/<COIN>.json.
+        state_dir_env = os.getenv("BOT_STATE_DIR", "runtime/active_positions")
+        self._state_dir = Path(state_dir_env)
+        try:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            # Non-fatal: if we can't write state, daily-restart workaround degrades
+            # gracefully to the existing wide-stop reconcile.
+            log.warning("Could not create state dir %s: %s", self._state_dir, exc)
+        self._state_path = self._state_dir / f"{self.coin}.json"
+        # Track the last persisted state to avoid redundant writes on every tick.
+        self._last_persisted_hash: str | None = None
 
     # ---- Public surface (mirrors PaperOrderManager) ----
 
@@ -265,6 +291,9 @@ class HyperliquidOrderManager:
         # Only expire if no fill happened (pending_entry still set).
         updates.extend(self._maybe_expire_pending(trade.ts_ms))
         updates.extend(self._maybe_manage_open_position(trade))
+        # Persist position state to disk for the daily-restart workaround.
+        # No-op if the serialized state hasn't changed since last write.
+        self._persist_position()
         return updates
 
     def _maybe_detect_fill(self, now_ms: int) -> list[ExecutionUpdate]:
@@ -348,14 +377,24 @@ class HyperliquidOrderManager:
         return self._info
 
     def reconcile_on_startup(self) -> None:
-        """If a position already exists on HL (e.g. after a crash), restore local state.
+        """If a position already exists on HL (e.g. after a daily restart),
+        restore local state.
 
-        Does NOT recover stop/TP levels — those are lost. Best practice: manually
-        flatten any open positions before restarting the bot. This method exists
-        so the bot at least knows it has exposure (instead of placing duplicate entries).
+        Two-tier strategy:
+          1. **Persisted state** (preferred): if runtime/active_positions/<COIN>.json
+             exists, was written < PERSISTED_STATE_MAX_AGE_SEC ago, and matches
+             the current HL position size, restore the FULL state — original
+             stop, TPs, trail history, realized fees. This is the daily-restart
+             workaround: 60-90s offline doesn't lose any management context.
 
-        Sets a conservative wide stop at +/-2% from entry to limit unmanaged drift.
-        Disables TP1/TP2 (sets them to entry_price so they can never fire).
+          2. **Wide-stop fallback** (existing behavior): if no persisted state
+             or it's stale/mismatched, fall back to a conservative wide stop
+             (default 0.5% of notional) so unknown positions don't drift far.
+             TP1/TP2 set to entry — tp1 gated by tp1_filled=True (never fires),
+             tp2 fires on first tick at/above entry → closes at break-even.
+
+        Best practice still: manually flatten any open positions before a
+        planned restart if you don't trust the persisted state.
         """
         if not self.live_cfg.allow_live:
             return
@@ -366,56 +405,80 @@ class HyperliquidOrderManager:
         except Exception as exc:
             log.warning("HL user_state poll failed during startup reconcile: %s", exc, exc_info=True)
             return
+
+        # Find the matching position on HL (if any).
+        hl_pos: dict | None = None
         for ap in state.get("assetPositions", []):
             pos = ap.get("position", {})
-            if str(pos.get("coin", "")).upper() != self.coin.upper():
-                continue
-            szi_raw = pos.get("szi")
-            szi = float(szi_raw.get("base", 0)) if isinstance(szi_raw, dict) else float(szi_raw or 0)
-            if szi == 0:
-                continue
-            entry_px = float(pos.get("entryPx", 0))
-            if entry_px <= 0:
-                continue
-            side = Side.LONG if szi > 0 else Side.SHORT
-            # Conservative wide stop at -2% (LONG) or +2% (SHORT) to limit unmanaged drift
-            wide_stop = entry_px * (0.98 if side == Side.LONG else 1.02)
-            # TPs set to entry: tp1 is gated by tp1_filled=True (never fires);
-            # tp2 fires on first tick at-or-above entry (LONG) -> closes at break-even.
-            self.position = OpenPosition(
-                signal_id="reconciled",
-                side=side,
-                entry_price=entry_px,
-                stop_price=wide_stop,
-                tp1_price=entry_px,
-                tp2_price=entry_px,
-                opened_ms=int(time.time() * 1000),  # use wall clock so time-based exits behave normally
-                qty_initial=abs(szi),
-                qty_remaining=abs(szi),
-                risk_dollars=abs(szi * entry_px) * 0.02,  # rough — 2% of notional
-                coin=self.coin,
-                tp1_filled=True,  # mark as filled to prevent retry
-                best_price=entry_px,
-                worst_price=entry_px,
-            )
-            log.warning(
-                "Reconciled existing %s position [%s]: %s qty=%.6f entry=%.2f stop=%.2f "
-                "(manual cleanup recommended via scripts/flatten_live.py)",
-                self.coin, self.live_cfg.network, side.value, abs(szi), entry_px, wide_stop,
-            )
-            notional = abs(szi) * entry_px
-            if notional > self.live_cfg.max_notional_per_trade:
-                log.warning(
-                    "Reconciled %s position notional $%.2f EXCEEDS max_notional_per_trade=$%.2f — "
-                    "consider manual flatten via scripts/flatten_live.py",
-                    self.coin, notional, self.live_cfg.max_notional_per_trade,
-                )
-            break  # one position per coin in HL perp model
+            if str(pos.get("coin", "")).upper() == self.coin.upper():
+                szi_raw = pos.get("szi")
+                szi = float(szi_raw.get("base", 0)) if isinstance(szi_raw, dict) else float(szi_raw or 0)
+                if szi != 0:
+                    hl_pos = pos
+                break
 
-        # Also cancel any stale resting orders for this coin — they belong to the
-        # pre-restart bot's state which we've now lost. Operator can manually
-        # re-place via the next signal if intended.
+        # Tier 1: try restoring from persisted state (the daily-restart common case).
+        if self._try_restore_from_persisted(hl_pos):
+            self._cancel_stale_resting_orders(address)
+            return
+
+        # Tier 2: fallback wide-stop reconcile path.
+        if hl_pos is None:
+            self._cancel_stale_resting_orders(address)
+            return
+
+        szi_raw = hl_pos.get("szi")
+        szi = float(szi_raw.get("base", 0)) if isinstance(szi_raw, dict) else float(szi_raw or 0)
+        entry_px = float(hl_pos.get("entryPx", 0))
+        if entry_px <= 0:
+            return
+        side = Side.LONG if szi > 0 else Side.SHORT
+        # Tightened recovery stop: 0.5% (was 2%). For typical $30 notional, that's
+        # $0.15 max loss vs the old $0.60 — closer to the bot's normal trade risk.
+        # Still wide enough to avoid stop-out on routine market noise.
+        recovery_stop_pct = 0.005
+        wide_stop = entry_px * (1 - recovery_stop_pct) if side == Side.LONG else entry_px * (1 + recovery_stop_pct)
+        self.position = OpenPosition(
+            signal_id="reconciled",
+            side=side,
+            entry_price=entry_px,
+            stop_price=wide_stop,
+            tp1_price=entry_px,
+            tp2_price=entry_px,
+            opened_ms=int(time.time() * 1000),
+            qty_initial=abs(szi),
+            qty_remaining=abs(szi),
+            risk_dollars=abs(szi * entry_px) * recovery_stop_pct,
+            coin=self.coin,
+            tp1_filled=True,
+            best_price=entry_px,
+            worst_price=entry_px,
+        )
+        log.warning(
+            "Reconciled %s position via WIDE-STOP fallback [%s]: %s qty=%.6f entry=%.4f stop=%.4f "
+            "(persisted state missing/stale — original stop/TP lost)",
+            self.coin, self.live_cfg.network, side.value, abs(szi), entry_px, wide_stop,
+        )
+        notional = abs(szi) * entry_px
+        if notional > self.live_cfg.max_notional_per_trade:
+            log.warning(
+                "Reconciled %s position notional $%.2f EXCEEDS max_notional_per_trade=$%.2f — "
+                "consider manual flatten via scripts/flatten_live.py",
+                self.coin, notional, self.live_cfg.max_notional_per_trade,
+            )
+
+        self._cancel_stale_resting_orders(address)
+
+    def _cancel_stale_resting_orders(self, address: str) -> None:
+        """Cancel any resting orders for this coin at startup.
+
+        Orders surviving a restart are most likely pre-restart pending entries
+        that never filled — the local state for them is gone, so it's safer to
+        cancel than to let them potentially fill into a position the bot has
+        no management context for.
+        """
         try:
+            info = self._ensure_info()
             open_orders = info.open_orders(address)
             coin_orders = [
                 {"coin": o.get("coin"), "oid": o.get("oid")}
@@ -610,6 +673,170 @@ class HyperliquidOrderManager:
                     if new_stop < p.stop_price:
                         p.stop_price = new_stop
 
+    def _extract_fill(self, result, default_px: float) -> tuple[float, float] | None:
+        """Parse an exchange.order/market_close response and return (filled_qty, avg_px)
+        ONLY if HL confirmed the fill. Returns None when no fill is in the response —
+        callers MUST treat None as "do not clear local position state" because HL
+        likely still has the position.
+
+        This is the regression guard for the phantom-close-in-reverse bug observed
+        2026-05-04: market_close returned status=ok but with empty/error statuses,
+        and the bot used to fall through to clearing position state while HL kept
+        the position open as an orphan.
+        """
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            return None
+        statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+        if not statuses:
+            return None
+        st = statuses[0]
+        if not isinstance(st, dict) or "filled" not in st:
+            return None
+        filled = st["filled"]
+        try:
+            qty = float(filled.get("totalSz", 0))
+            px = float(filled.get("avgPx", default_px))
+        except (TypeError, ValueError):
+            return None
+        if qty <= 0:
+            return None
+        return qty, px
+
+    def _persist_position(self) -> None:
+        """Write current position state to disk so a daily-restart can resume
+        management exactly where it left off (correct stop, TP, trail history).
+
+        Called after every state-mutating tick. Writes are cheap (~500 bytes,
+        SSD-cached) and we skip writes when the serialized state is unchanged
+        from the last write.
+        """
+        if self.position is None:
+            self._clear_persisted_state()
+            return
+        p = self.position
+        data = {
+            "ts_ms": int(time.time() * 1000),
+            "coin": self.coin,
+            "signal_id": p.signal_id,
+            "side": p.side.value,
+            "entry_price": p.entry_price,
+            "stop_price": p.stop_price,
+            "tp1_price": p.tp1_price,
+            "tp2_price": p.tp2_price,
+            "qty_initial": p.qty_initial,
+            "qty_remaining": p.qty_remaining,
+            "tp1_filled": p.tp1_filled,
+            "best_price": p.best_price,
+            "worst_price": p.worst_price,
+            "realized_pnl": p.realized_pnl,
+            "realized_fees": p.realized_fees,
+            "risk_dollars": p.risk_dollars,
+            "opened_ms": p.opened_ms,
+        }
+        # Skip the file write if nothing meaningful changed (excluding ts_ms).
+        sig = json.dumps({k: v for k, v in data.items() if k != "ts_ms"}, sort_keys=True)
+        if sig == self._last_persisted_hash:
+            return
+        try:
+            tmp = self._state_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data))
+            os.replace(tmp, self._state_path)  # atomic rename so partial writes can't corrupt
+            self._last_persisted_hash = sig
+        except Exception as exc:
+            log.warning("Failed to persist position state to %s: %s", self._state_path, exc)
+
+    def _clear_persisted_state(self) -> None:
+        """Delete the persisted state file. Called on every clean position close."""
+        self._last_persisted_hash = None
+        try:
+            if self._state_path.exists():
+                self._state_path.unlink()
+        except Exception as exc:
+            log.warning("Failed to clear persisted state %s: %s", self._state_path, exc)
+
+    def _try_restore_from_persisted(self, hl_position: dict | None) -> bool:
+        """Try to restore self.position from the persisted state file.
+
+        Returns True if restoration succeeded. The caller (reconcile_on_startup)
+        falls through to the wide-stop reconcile path on False.
+
+        Safety checks:
+          - File must exist and be < PERSISTED_STATE_MAX_AGE_SEC old
+          - HL must have a matching position (sign + size within 1%)
+          - JSON must parse and contain all required fields
+        """
+        if not self._state_path.exists():
+            return False
+        try:
+            data = json.loads(self._state_path.read_text())
+        except Exception as exc:
+            log.warning("Persisted state %s unreadable: %s — falling through to wide-stop reconcile",
+                        self._state_path, exc)
+            return False
+
+        age_sec = (time.time() * 1000 - data.get("ts_ms", 0)) / 1000.0
+        if age_sec > PERSISTED_STATE_MAX_AGE_SEC:
+            log.warning("Persisted state for %s is stale (age=%.1fs > %ds) — falling through",
+                        self.coin, age_sec, PERSISTED_STATE_MAX_AGE_SEC)
+            return False
+
+        if hl_position is None:
+            log.warning("Persisted state for %s exists but HL has no matching position — clearing stale file",
+                        self.coin)
+            self._clear_persisted_state()
+            return False
+
+        szi_raw = hl_position.get("szi")
+        hl_qty_signed = float(szi_raw.get("base", 0)) if isinstance(szi_raw, dict) else float(szi_raw or 0)
+        hl_qty = abs(hl_qty_signed)
+        persisted_qty = float(data.get("qty_remaining", 0))
+        if persisted_qty <= 0 or abs(hl_qty - persisted_qty) > max(persisted_qty * 0.01, 1e-6):
+            log.warning(
+                "Persisted state qty=%s doesn't match HL qty=%s for %s — falling through to wide-stop reconcile",
+                persisted_qty, hl_qty, self.coin,
+            )
+            return False
+
+        # Sign check: persisted "long" must match HL positive szi (and vice versa)
+        persisted_long = data.get("side") == Side.LONG.value
+        hl_long = hl_qty_signed > 0
+        if persisted_long != hl_long:
+            log.warning("Persisted side doesn't match HL sign for %s — falling through", self.coin)
+            return False
+
+        # Restore the position with all original management state
+        try:
+            self.position = OpenPosition(
+                signal_id=str(data["signal_id"]),
+                side=Side.LONG if persisted_long else Side.SHORT,
+                entry_price=float(data["entry_price"]),
+                stop_price=float(data["stop_price"]),
+                tp1_price=float(data["tp1_price"]),
+                tp2_price=float(data["tp2_price"]),
+                opened_ms=int(data["opened_ms"]),
+                qty_initial=float(data["qty_initial"]),
+                qty_remaining=float(data["qty_remaining"]),
+                risk_dollars=float(data["risk_dollars"]),
+                coin=self.coin,
+                tp1_filled=bool(data.get("tp1_filled", False)),
+                realized_pnl=float(data.get("realized_pnl", 0)),
+                realized_fees=float(data.get("realized_fees", 0)),
+                best_price=float(data.get("best_price", data["entry_price"])),
+                worst_price=float(data.get("worst_price", data["entry_price"])),
+            )
+        except Exception as exc:
+            log.warning("Failed to construct OpenPosition from persisted state: %s — falling through", exc)
+            return False
+
+        log.info(
+            "Restored persisted position state for %s [%s]: %s qty=%.6f entry=%.4f stop=%.4f "
+            "tp1=%.4f tp2=%.4f tp1_filled=%s age=%.1fs",
+            self.coin, self.live_cfg.network, self.position.side.value,
+            self.position.qty_remaining, self.position.entry_price, self.position.stop_price,
+            self.position.tp1_price, self.position.tp2_price, self.position.tp1_filled, age_sec,
+        )
+        return True
+
     def _partial_close_tp1(self, ts_ms: int, trade_price: float) -> list[ExecutionUpdate]:
         """Partial-close 50% of remaining qty at TP1 via market_close (taker fee)."""
         p = self.position
@@ -637,30 +864,40 @@ class HyperliquidOrderManager:
             )
             return []
 
-        fill_px = trade_price
-        if isinstance(result, dict) and result.get("status") == "ok":
-            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-            if statuses:
-                st = statuses[0]
-                if "filled" in st:
-                    fill_px = float(st["filled"].get("avgPx", trade_price))
+        # Verify HL actually filled before mutating local state. If no fill in the
+        # response, log critically and DO NOT modify position — next tick will retry
+        # the trail/exit logic. Phantom-close-in-reverse regression guard.
+        extracted = self._extract_fill(result, default_px=trade_price)
+        if extracted is None:
+            log.critical(
+                "HL TP1 market_close for %s returned status=ok but NO filled status in response. "
+                "HL likely still has the position. Local state retained; will retry on next tick. "
+                "Response: %s",
+                self.coin, result,
+            )
+            return []
+        actual_qty, fill_px = extracted
 
-        # Realize the partial PnL + taker fee on the closed half
+        # Use the actual filled qty (not the requested) so partial-of-partial fills
+        # don't desync local from HL.
         if p.side == Side.LONG:
-            partial_pnl = (fill_px - p.entry_price) * partial_qty
+            partial_pnl = (fill_px - p.entry_price) * actual_qty
         else:
-            partial_pnl = (p.entry_price - fill_px) * partial_qty
-        partial_fee = (fill_px * partial_qty) * self.cfg.taker_fee_pct
+            partial_pnl = (p.entry_price - fill_px) * actual_qty
+        partial_fee = (fill_px * actual_qty) * self.cfg.taker_fee_pct
         p.realized_pnl += partial_pnl
         p.realized_fees += partial_fee
-        p.qty_remaining -= partial_qty
-        p.tp1_filled = True
-        # Reduce tail risk after first scale (move stop to BE).
-        p.stop_price = p.entry_price
+        p.qty_remaining -= actual_qty
+        # Only mark tp1_filled and move stop to BE if we actually closed ~half.
+        # If HL filled less than requested (rare on IOC), defer the BE-stop move
+        # until a future tick fills the rest.
+        if actual_qty >= partial_qty * 0.99:
+            p.tp1_filled = True
+            p.stop_price = p.entry_price  # reduce tail risk after first scale
         return [ExecutionUpdate(
             ts_ms=ts_ms,
             event_type=ExecEventType.PARTIAL_TP,
-            message=f"hl tp1 partial [{self.live_cfg.network}]: qty={partial_qty:.6f} @ {fill_px:.2f} (stop->BE)",
+            message=f"hl tp1 partial [{self.live_cfg.network}]: qty={actual_qty:.6f} @ {fill_px:.4f} (stop->BE={p.tp1_filled})",
             signal_id=p.signal_id,
         )]
 
@@ -669,16 +906,17 @@ class HyperliquidOrderManager:
         if p is None:
             return []
         exchange = self._ensure_exchange()
+        requested_qty = p.qty_remaining
         try:
             result = exchange.market_close(
                 coin=self.coin,
-                sz=p.qty_remaining,
+                sz=requested_qty,
                 slippage=0.005,  # 0.5% slippage tolerance
             )
         except Exception as exc:
             log.error(
                 "HL market_close failed for %s qty=%s: %s",
-                self.coin, p.qty_remaining, exc, exc_info=True,
+                self.coin, requested_qty, exc, exc_info=True,
             )
             # Cannot proceed: leaving position in place. Operator must manually intervene.
             return []
@@ -703,25 +941,57 @@ class HyperliquidOrderManager:
                 closed_trade=None,  # no realized trade — phantom close
             )]
 
-        # Fall back to the trigger trade.price (not entry_price) when the HL
-        # response is malformed: entry_price would silently understate losses
-        # on a stop-out from a fast move.
-        fill_px = trade_price
-        if isinstance(result, dict) and result.get("status") == "ok":
-            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-            if statuses:
-                st = statuses[0]
-                if "filled" in st:
-                    fill_px = float(st["filled"].get("avgPx", trade_price))
+        # Verify HL actually filled before mutating local state. The bug observed
+        # 2026-05-04: market_close returned status=ok but with no "filled" status,
+        # and the bot used to fall through with fill_px=trade_price and clear
+        # local state. HL kept the position open as an unmanaged orphan.
+        extracted = self._extract_fill(result, default_px=trade_price)
+        if extracted is None:
+            log.critical(
+                "HL market_close for %s qty=%s returned status=ok but NO filled status. "
+                "HL likely still has the position. Local state retained; will retry on next tick. "
+                "Response: %s",
+                self.coin, requested_qty, result,
+            )
+            return []
+        actual_qty, fill_px = extracted
 
+        # Handle partial fills: if HL filled less than requested, only realize PnL
+        # on the filled portion and keep the residual position open. Stop/TP logic
+        # will continue to fire on subsequent ticks for the remainder.
+        if actual_qty < requested_qty * 0.99:
+            log.warning(
+                "HL market_close for %s only filled %s of requested %s — keeping residual open",
+                self.coin, actual_qty, requested_qty,
+            )
+            if p.side == Side.LONG:
+                partial_pnl = (fill_px - p.entry_price) * actual_qty
+            else:
+                partial_pnl = (p.entry_price - fill_px) * actual_qty
+            partial_fee = (fill_px * actual_qty) * self.cfg.taker_fee_pct
+            p.realized_pnl += partial_pnl
+            p.realized_fees += partial_fee
+            p.qty_remaining -= actual_qty
+            return [ExecutionUpdate(
+                ts_ms=ts_ms,
+                event_type=ExecEventType.PARTIAL_TP,
+                message=(
+                    f"hl partial close [{self.live_cfg.network}] ({reason}): "
+                    f"qty={actual_qty:.6f}/{requested_qty:.6f} @ {fill_px:.4f} "
+                    f"residual={p.qty_remaining:.6f}"
+                ),
+                signal_id=p.signal_id,
+            )]
+
+        # Full close — proceed with normal close accounting using actual fill data.
         pnl_gross = (
-            (fill_px - p.entry_price) * p.qty_remaining
+            (fill_px - p.entry_price) * actual_qty
             if p.side == Side.LONG
-            else (p.entry_price - fill_px) * p.qty_remaining
+            else (p.entry_price - fill_px) * actual_qty
         )
         pnl_gross += p.realized_pnl
         # Fees: taker on the market_close
-        final_fee = (fill_px * p.qty_remaining) * self.cfg.taker_fee_pct
+        final_fee = (fill_px * actual_qty) * self.cfg.taker_fee_pct
         fees_paid = p.realized_fees + final_fee
         pnl_net = pnl_gross - fees_paid
         risk = max(p.risk_dollars, 1e-9)
