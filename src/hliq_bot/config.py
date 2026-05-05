@@ -104,6 +104,19 @@ class StrategyConfig:
     min_tp1_bps: float = 25.0
     min_tp2_bps: float = 50.0
     long_only: bool = True
+    # Selectivity gates: block low-quality signals before they become entries.
+    # min_signal_score is a floor on the data-grounded signal_score (0.0-1.0)
+    # — set to e.g. 0.55 to require above-median quality, lowering trade rate
+    # but raising average expected R per trade. Default 0.0 = no floor.
+    min_signal_score: float = 0.0
+    # Regime filter: block longs in clear downtrends and shorts in clear uptrends.
+    # Computed as (current_close - MA(N bars)) / MA × 100. If absolute pct exceeds
+    # threshold AND in unfavorable direction for the signal's side, block.
+    # Set regime_filter_enabled=False to disable. Default off so existing behavior
+    # is preserved unless explicitly enabled.
+    regime_filter_enabled: bool = False
+    regime_filter_ma_bars: int = 30
+    regime_filter_threshold_pct: float = 0.4
     trail_after_tp1: bool = True
     trail_factor: float = 0.5
     early_exit_sec: int = 120
@@ -342,6 +355,10 @@ def load_config() -> AppConfig:
         min_tp1_bps=_env_float("BOT_MIN_TP1_BPS", 25.0),
         min_tp2_bps=_env_float("BOT_MIN_TP2_BPS", 50.0),
         long_only=_env_bool("BOT_LONG_ONLY", True),
+        min_signal_score=_env_float("BOT_MIN_SIGNAL_SCORE", 0.0),
+        regime_filter_enabled=_env_bool("BOT_REGIME_FILTER_ENABLED", False),
+        regime_filter_ma_bars=_env_int("BOT_REGIME_FILTER_MA_BARS", 30),
+        regime_filter_threshold_pct=_env_float("BOT_REGIME_FILTER_THRESHOLD_PCT", 0.4),
         trail_after_tp1=_env_bool("BOT_TRAIL_AFTER_TP1", True),
         trail_factor=_env_float("BOT_TRAIL_FACTOR", 0.5),
         early_exit_sec=_env_int("BOT_EARLY_EXIT_SEC", 120),

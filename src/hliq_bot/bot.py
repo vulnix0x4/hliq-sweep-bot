@@ -852,6 +852,69 @@ class SweepBot:
                 log.info("Signal blocked: %s", reason)
                 continue
 
+            # Signal-quality floor: block low-score signals entirely (when configured).
+            # The data-grounded signal_score (0.0-1.0) is computed in the detector
+            # from wick_ratio (45%), reclaim_bps, overshoot_bps, volume_ratio, and
+            # a confidence x regime mix. Setting min_signal_score > 0 trades
+            # selectivity for fewer trades — useful when fee drag is significant
+            # vs typical edge.
+            score_floor = self.cfg.strategy.min_signal_score
+            if score_floor > 0.0 and signal.signal_score < score_floor:
+                self._count_block("signal_score_floor")
+                reason = f"signal_score<{score_floor:.2f}"
+                self.journal.write(
+                    "decision",
+                    signal_id,
+                    {
+                        "ts_ms": bar.end_ms,
+                        "allowed": False,
+                        "reason": reason,
+                        "signal_score": signal.signal_score,
+                        "coin": w.coin,
+                    },
+                )
+                log.info("Signal blocked: %s (score=%.2f)", reason, signal.signal_score)
+                continue
+
+            # Regime filter: block longs in clear downtrend, shorts in clear uptrend.
+            # Mean-reversion sweep+rejection structurally fails when price is in a
+            # sustained directional move — see live data 2026-04-29 to 05-01 (5
+            # consecutive long entries during ETH downtrend, all losses). When
+            # enabled, computes (current - MA(N)) / MA × 100 and blocks signals
+            # whose direction would be fighting the regime.
+            if self.cfg.strategy.regime_filter_enabled:
+                ma_bars = max(2, self.cfg.strategy.regime_filter_ma_bars)
+                threshold = self.cfg.strategy.regime_filter_threshold_pct
+                closes = list(w.recent_closes)
+                if len(closes) >= ma_bars:
+                    ma = sum(closes[-ma_bars:]) / ma_bars
+                    pct_from_ma = ((bar.close - ma) / ma) * 100.0
+                    blocked_by_regime = (
+                        (signal.side == Side.LONG and pct_from_ma < -threshold) or
+                        (signal.side == Side.SHORT and pct_from_ma > threshold)
+                    )
+                    if blocked_by_regime:
+                        regime_dir = "downtrend" if pct_from_ma < 0 else "uptrend"
+                        self._count_block("regime_filter")
+                        reason = f"regime_filter:{regime_dir}_blocks_{signal.side.value}"
+                        self.journal.write(
+                            "decision",
+                            signal_id,
+                            {
+                                "ts_ms": bar.end_ms,
+                                "allowed": False,
+                                "reason": reason,
+                                "pct_from_ma": pct_from_ma,
+                                "ma_bars": ma_bars,
+                                "coin": w.coin,
+                            },
+                        )
+                        log.info(
+                            "Signal blocked: %s (price %.3f%% from %d-bar MA)",
+                            reason, pct_from_ma, ma_bars,
+                        )
+                        continue
+
             ml_decision = self.ml_gate.evaluate(ml_features)
             ml_gate_mode = self._ml_decision_mode()
             if ml_gate_mode == "gate" and not ml_decision.allowed:
