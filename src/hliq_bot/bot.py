@@ -13,6 +13,8 @@ import threading
 import time
 from typing import Any
 
+from hliq_bot.ai.market_data import MarketDataCache
+from hliq_bot.ai.memory import AIMemory, MemoryEntry
 from hliq_bot.ai.strategy import AIDecisionResult, AIStrategy
 from hliq_bot.analytics.market_capture import MarketCaptureWriter
 from hliq_bot.analytics.journal import SignalJournal
@@ -205,8 +207,32 @@ class SweepBot:
         # AI strategy: when enabled, polls an LLM per coin on a timer and
         # acts on its decisions instead of the rule-based sweep detector.
         self.ai_strategy: AIStrategy | None = None
+        self.ai_memory: AIMemory | None = None
+        self.ai_market_data: MarketDataCache | None = None
         if config.ai.enabled:
-            self.ai_strategy = AIStrategy(config.ai)
+            mem_path = self._resolve_project_path(config.ai.memory_path)
+            self.ai_memory = AIMemory(mem_path, max_entries=config.ai.memory_max_entries)
+            loaded_count = self.ai_memory.load()
+            # Construct MarketDataCache lazily — uses HL Info SDK. Skip on
+            # paper mode without HL credentials; AI will still work but
+            # without funding/OI/L2 enrichment.
+            try:
+                from hyperliquid.info import Info
+                from hyperliquid.utils import constants
+                api_url = (
+                    constants.MAINNET_API_URL
+                    if config.live.network == "mainnet"
+                    else constants.TESTNET_API_URL
+                )
+                self.ai_market_data = MarketDataCache(Info(api_url, skip_ws=True))
+            except Exception as exc:
+                log.warning(
+                    "AI market_data cache disabled (HL SDK init failed: %s) — "
+                    "funding/OI/L2 enrichment will be absent from prompts.", exc,
+                )
+            self.ai_strategy = AIStrategy(
+                config.ai, memory=self.ai_memory, market_data=self.ai_market_data,
+            )
             # AI strategy wants longer holds than sweep — raise the executor's
             # time-stop so positions can run as long as the AI intends. Don't
             # shrink: the existing value is the operator's choice.
@@ -216,10 +242,14 @@ class SweepBot:
                     config.strategy.max_holding_sec, config.ai.max_holding_sec,
                 )
                 config.strategy.max_holding_sec = config.ai.max_holding_sec
+            stats = self.ai_memory.summary_stats()
             log.info(
-                "AI strategy ENABLED: provider=%s model=%s interval=%ds budget=$%.2f/day max_holding=%ds",
-                config.ai.provider, config.ai.model, config.ai.interval_sec,
+                "AI strategy ENABLED: model=%s fallbacks=%s interval=%ds budget=$%.2f/day "
+                "max_holding=%ds prompt=%s memory=%s (loaded=%d resolved=%d avg_r=%.3f pnl=%.4f)",
+                config.ai.model, config.ai.fallback_models, config.ai.interval_sec,
                 config.ai.daily_budget_usd, config.ai.max_holding_sec,
+                config.ai.prompt_version, mem_path, loaded_count,
+                stats["resolved_trades"], stats["avg_r"], stats["total_pnl"],
             )
         # Buffer of recent AI-driven closed trades for self-reflection in
         # later prompts. Trimmed to last 10 for token efficiency.
@@ -899,6 +929,20 @@ class SweepBot:
                     # Keep only last 10 — context budget.
                     if len(self._ai_recent_outcomes) > 10:
                         self._ai_recent_outcomes = self._ai_recent_outcomes[-10:]
+                # Persistent memory: attach the outcome to the matching
+                # decision so it survives restart and shows up in future
+                # prompts as "you decided X and it produced Y".
+                if self.ai_memory is not None:
+                    ct = update.closed_trade
+                    hold_sec = max(0.0, (ct.closed_ms - ct.opened_ms) / 1000.0)
+                    self.ai_memory.record_outcome(
+                        ct.signal_id,
+                        ts_ms=ct.closed_ms,
+                        exit_reason=ct.exit_reason,
+                        pnl=ct.pnl,
+                        r_multiple=ct.r_multiple,
+                        hold_sec=hold_sec,
+                    )
                 if ml_prob is not None:
                     self.ml_gate.register_outcome(
                         probability=ml_prob,
@@ -1972,6 +2016,7 @@ class SweepBot:
             daily_pnl=self.risk.daily_pnl,
             daily_r=self.risk.daily_r,
             recent_outcomes=list(self._ai_recent_outcomes),
+            workers_by_coin=dict(self._workers),
         )
         self._handle_ai_decision(w, bar, result)
 
@@ -1991,16 +2036,48 @@ class SweepBot:
                 "cost_usd": result.cost_usd,
                 "latency_ms": result.latency_ms,
                 "model": result.model,
+                "prompt_version": self.cfg.ai.prompt_version,
                 "error": result.error,
                 "skip_reason": result.skip_reason,
                 "budget_spent_24h": round(self.ai_strategy.budget.spent_last_24h(now_ms=bar.end_ms), 6) if self.ai_strategy else 0.0,
             },
         )
+        # Persistent memory: record every actionable (non-skip/error) decision.
+        if self.ai_memory is not None and result.action in {"open_long", "open_short", "close", "hold"}:
+            entry = MemoryEntry(
+                decision_id=decision_id,
+                ts_ms=bar.end_ms,
+                coin=w.coin,
+                action=result.action,
+                reasoning=result.reasoning,
+                confidence=result.confidence,
+                stop_price=result.signal.stop_price if result.signal else None,
+                tp1_price=result.signal.tp1_price if result.signal else None,
+                tp2_price=result.signal.tp2_price if result.signal else None,
+                entry_price=result.signal.entry_price if result.signal else None,
+            )
+            self.ai_memory.record_decision(entry)
         if result.action in {"hold", "skipped", "error"}:
             return
 
         if result.action == "close":
             self._ai_force_close(w, bar, decision_id, result.reasoning)
+            return
+
+        if result.action == "move_stop_to_breakeven":
+            self._ai_move_stop_to_be(w, bar, decision_id, result.reasoning)
+            return
+
+        if result.action == "modify_stop":
+            self._ai_modify_stop(w, bar, decision_id, result)
+            return
+
+        if result.action == "scale_out":
+            self._ai_scale_out(w, bar, decision_id, result)
+            return
+
+        if result.action == "add_to_position":
+            self._ai_add_to_position(w, bar, decision_id, result)
             return
 
         if result.action in {"open_long", "open_short"} and result.signal is not None:
@@ -2165,6 +2242,209 @@ class SweepBot:
             self._entries_placed += 1
             w.entries_placed += 1
         log.info("AI %s on %s: %s", result.action, w.coin, update.message)
+
+    def _ai_move_stop_to_be(self, w: CoinWorker, bar: Bar, decision_id: str, reason: str) -> None:
+        position = getattr(w.executor, "position", None)
+        if position is None:
+            return
+        old = position.stop_price
+        position.stop_price = position.entry_price
+        if hasattr(w.executor, "_replace_native_stop"):
+            try:
+                w.executor._replace_native_stop()
+            except Exception as exc:
+                log.warning("AI move_stop_to_be: native stop replace failed: %s", exc)
+        self.journal.write(
+            "decision", decision_id,
+            {
+                "ts_ms": bar.end_ms, "allowed": True, "coin": w.coin,
+                "reason": "ai_move_stop_to_be",
+                "ai_reasoning": reason,
+                "old_stop": old, "new_stop": position.stop_price,
+            },
+        )
+        log.info("AI move_stop_to_be %s: %.6f -> %.6f", w.coin, old, position.stop_price)
+
+    def _ai_modify_stop(self, w: CoinWorker, bar: Bar, decision_id: str, result: AIDecisionResult) -> None:
+        position = getattr(w.executor, "position", None)
+        if position is None or result.new_stop_price is None:
+            return
+        old = position.stop_price
+        new = result.new_stop_price
+        # Validate strict improvement: never widen the stop.
+        if position.side == Side.LONG and new <= old:
+            log.info("AI modify_stop %s rejected: new=%.6f not strictly above old=%.6f (long)", w.coin, new, old)
+            return
+        if position.side == Side.SHORT and new >= old:
+            log.info("AI modify_stop %s rejected: new=%.6f not strictly below old=%.6f (short)", w.coin, new, old)
+            return
+        # Validate new stop is still on the LOSING side of entry.
+        if position.side == Side.LONG and new >= position.entry_price:
+            # Allow if entry-or-better (move to BE+) but only if currently profitable
+            mid = (w.last_best_bid + w.last_best_ask) / 2.0 if (w.last_best_bid and w.last_best_ask) else bar.close
+            if mid <= position.entry_price:
+                log.info("AI modify_stop %s rejected: new>=entry but not yet profitable", w.coin)
+                return
+        if position.side == Side.SHORT and new <= position.entry_price:
+            mid = (w.last_best_bid + w.last_best_ask) / 2.0 if (w.last_best_bid and w.last_best_ask) else bar.close
+            if mid >= position.entry_price:
+                log.info("AI modify_stop %s rejected: new<=entry but not yet profitable", w.coin)
+                return
+        position.stop_price = new
+        if hasattr(w.executor, "_replace_native_stop"):
+            try:
+                w.executor._replace_native_stop()
+            except Exception as exc:
+                log.warning("AI modify_stop: native stop replace failed: %s", exc)
+        self.journal.write(
+            "decision", decision_id,
+            {
+                "ts_ms": bar.end_ms, "allowed": True, "coin": w.coin,
+                "reason": "ai_modify_stop",
+                "ai_reasoning": result.reasoning,
+                "old_stop": old, "new_stop": new,
+            },
+        )
+        log.info("AI modify_stop %s: %.6f -> %.6f", w.coin, old, new)
+
+    def _ai_scale_out(self, w: CoinWorker, bar: Bar, decision_id: str, result: AIDecisionResult) -> None:
+        position = getattr(w.executor, "position", None)
+        if position is None or result.scale_fraction is None:
+            return
+        if position.qty_remaining <= 0:
+            return
+        # For HL executor, use the existing partial-close machinery.
+        # For paper executor, mutate qty + realize fees/pnl ourselves
+        # (simpler than adding a partial-close to PaperOrderManager).
+        if hasattr(w.executor, "_partial_close_tp1"):
+            # HL: temporarily override the partial fraction by faking TP1 logic.
+            # Easier approach: call market_close at scale_fraction directly.
+            mid = (w.last_best_bid + w.last_best_ask) / 2.0 if (w.last_best_bid and w.last_best_ask) else bar.close
+            self._ai_hl_scale_out(w, bar, decision_id, result, mid)
+        else:
+            self._ai_paper_scale_out(w, bar, decision_id, result)
+
+    def _ai_hl_scale_out(self, w: CoinWorker, bar: Bar, decision_id: str, result: AIDecisionResult, mid: float) -> None:
+        """HL scale-out: market_close a fraction of remaining qty."""
+        position = w.executor.position
+        partial_qty = position.qty_remaining * result.scale_fraction
+        if partial_qty <= 0:
+            return
+        try:
+            exchange = w.executor._ensure_exchange()
+            res = exchange.market_close(coin=w.executor.coin, sz=partial_qty, slippage=0.005)
+        except Exception as exc:
+            log.warning("AI scale_out market_close failed for %s: %s", w.coin, exc)
+            return
+        # Best-effort fill extraction; if no fill, log and skip mutation.
+        extracted = w.executor._extract_fill(res, default_px=mid) if res is not None else None
+        if extracted is None:
+            log.warning("AI scale_out %s: no fill in response; skipping local mutation", w.coin)
+            return
+        actual_qty, fill_px = extracted
+        if position.side == Side.LONG:
+            partial_pnl = (fill_px - position.entry_price) * actual_qty
+        else:
+            partial_pnl = (position.entry_price - fill_px) * actual_qty
+        partial_fee = (fill_px * actual_qty) * w.executor.cfg.taker_fee_pct
+        position.realized_pnl += partial_pnl
+        position.realized_fees += partial_fee
+        position.qty_remaining -= actual_qty
+        if hasattr(w.executor, "_replace_native_stop"):
+            try:
+                w.executor._replace_native_stop()
+            except Exception:
+                pass
+        self.journal.write(
+            "decision", decision_id,
+            {
+                "ts_ms": bar.end_ms, "allowed": True, "coin": w.coin,
+                "reason": "ai_scale_out",
+                "ai_reasoning": result.reasoning,
+                "scale_fraction": result.scale_fraction,
+                "filled_qty": actual_qty, "fill_px": fill_px,
+                "partial_pnl": partial_pnl,
+            },
+        )
+        log.info("AI scale_out %s: %.6f @ %.6f pnl=%.4f", w.coin, actual_qty, fill_px, partial_pnl)
+
+    def _ai_paper_scale_out(self, w: CoinWorker, bar: Bar, decision_id: str, result: AIDecisionResult) -> None:
+        """Paper scale-out: mutate qty + realize PnL at current mid."""
+        position = w.executor.position
+        partial_qty = position.qty_remaining * result.scale_fraction
+        if partial_qty <= 0:
+            return
+        mid = (w.last_best_bid + w.last_best_ask) / 2.0 if (w.last_best_bid and w.last_best_ask) else bar.close
+        if position.side == Side.LONG:
+            partial_pnl = (mid - position.entry_price) * partial_qty
+        else:
+            partial_pnl = (position.entry_price - mid) * partial_qty
+        partial_fee = (mid * partial_qty) * self.cfg.strategy.taker_fee_pct
+        position.realized_pnl += partial_pnl
+        position.realized_fees += partial_fee
+        position.qty_remaining -= partial_qty
+        self.journal.write(
+            "decision", decision_id,
+            {
+                "ts_ms": bar.end_ms, "allowed": True, "coin": w.coin,
+                "reason": "ai_scale_out_paper",
+                "ai_reasoning": result.reasoning,
+                "scale_fraction": result.scale_fraction,
+                "filled_qty": partial_qty, "fill_px": mid,
+                "partial_pnl": partial_pnl,
+            },
+        )
+        log.info("AI paper scale_out %s: %.6f @ %.6f pnl=%.4f", w.coin, partial_qty, mid, partial_pnl)
+
+    def _ai_add_to_position(self, w: CoinWorker, bar: Bar, decision_id: str, result: AIDecisionResult) -> None:
+        """Add to a winning position. Only allowed when current unrealized R >= 0.5."""
+        position = getattr(w.executor, "position", None)
+        if position is None or result.signal is None or result.add_qty_fraction is None:
+            return
+        mid = (w.last_best_bid + w.last_best_ask) / 2.0 if (w.last_best_bid and w.last_best_ask) else bar.close
+        if position.side == Side.LONG:
+            unrealized = (mid - position.entry_price) * position.qty_remaining
+        else:
+            unrealized = (position.entry_price - mid) * position.qty_remaining
+        if position.risk_dollars > 0:
+            unrealized_r = unrealized / position.risk_dollars
+            if unrealized_r < 0.5:
+                self.journal.write(
+                    "decision", decision_id,
+                    {
+                        "ts_ms": bar.end_ms, "allowed": False, "coin": w.coin,
+                        "reason": f"ai_add_blocked_unrealized_r:{unrealized_r:.2f}",
+                        "ai_reasoning": result.reasoning,
+                    },
+                )
+                log.info("AI add_to_position %s blocked: unrealized_r=%.2f < 0.5", w.coin, unrealized_r)
+                return
+        # Sized as a fresh entry at reduced risk via add_qty_fraction.
+        sizing = self.risk.size_position(
+            result.signal.entry_price,
+            result.signal.stop_price,
+            risk_multiplier=self.cfg.ai.risk_multiplier * result.add_qty_fraction,
+        )
+        if sizing.qty <= 0:
+            return
+        # NOTE: HL/paper executors don't currently support "add to existing
+        # position" cleanly — submitting a fresh order while a position is
+        # open would create a second leg. For safety, log + skip until we add
+        # explicit add-on support to the executor.
+        self.journal.write(
+            "decision", decision_id,
+            {
+                "ts_ms": bar.end_ms, "allowed": False, "coin": w.coin,
+                "reason": "ai_add_not_implemented",
+                "ai_reasoning": result.reasoning,
+                "would_add_qty": sizing.qty,
+            },
+        )
+        log.warning(
+            "AI add_to_position requested for %s (qty=%.8f) — executor doesn't yet support "
+            "add-ons; logging intent only. Add ExecutorAddOn API to enable.",
+            w.coin, sizing.qty,
+        )
 
     def _maybe_refresh_deadmans(self, now_ms: int) -> None:
         """Push HL's schedule_cancel timer forward when the per-executor refresh

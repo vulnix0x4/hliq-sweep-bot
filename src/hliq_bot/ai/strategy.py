@@ -19,8 +19,10 @@ import os
 import time
 from typing import Any
 
-from hliq_bot.ai.client import AICallResult, AIClientError, CostBudget, OpenRouterClient
+from hliq_bot.ai.client import AICallResult, AIClientError, CostBudget, OpenRouterClient, ResilientLLM
 from hliq_bot.ai.context import CoinContext, build_coin_context
+from hliq_bot.ai.market_data import MarketDataCache
+from hliq_bot.ai.memory import AIMemory, MemoryEntry
 from hliq_bot.ai.prompts import SYSTEM_PROMPT, build_user_message, decision_schema
 from hliq_bot.config import AIConfig
 from hliq_bot.models import Bar, Side, SweepSignal
@@ -32,14 +34,20 @@ log = logging.getLogger(__name__)
 class AIDecisionResult:
     """Outcome of one decide_for_coin call. The bot consumes this."""
     coin: str
-    action: str               # open_long | open_short | close | hold | error | skipped
-    signal: SweepSignal | None  # populated for open_long / open_short
+    action: str               # open_long | open_short | close | hold | modify_stop |
+                              # move_stop_to_breakeven | scale_out | add_to_position |
+                              # error | skipped
+    signal: SweepSignal | None  # populated for open_long / open_short / add_to_position
     reasoning: str
     confidence: float
     raw_decision: dict[str, Any] | None
     cost_usd: float
     latency_ms: int
     model: str
+    # Action-specific parameters (only set for the relevant action):
+    new_stop_price: float | None = None        # for modify_stop
+    scale_fraction: float | None = None        # for scale_out
+    add_qty_fraction: float | None = None      # for add_to_position
     error: str | None = None
     skip_reason: str | None = None
 
@@ -58,6 +66,8 @@ class AIStrategy:
         cfg: AIConfig,
         *,
         api_key: str | None = None,
+        memory: AIMemory | None = None,
+        market_data: MarketDataCache | None = None,
     ) -> None:
         self.cfg = cfg
         # Track last-decision timestamps to enforce per-coin cadence.
@@ -66,8 +76,15 @@ class AIStrategy:
         self._call_times_ms: list[int] = []
         # Cost tracker (24h rolling window).
         self.budget = CostBudget(cfg.daily_budget_usd)
-        # LLM client (lazy import-safe; only constructed when enabled).
+        # Persistent AI trade memory (optional — callers pass it in).
+        self.memory: AIMemory | None = memory
+        if self.memory is not None:
+            self.memory.load()
+        # HL market-data cache for funding/OI/L2/etc enrichment (optional).
+        self.market_data: MarketDataCache | None = market_data
+        # LLM client. When enabled, wrap in ResilientLLM with fallback chain.
         self._client: OpenRouterClient | None = None
+        self._llm: ResilientLLM | None = None
         if cfg.enabled:
             key = api_key if api_key is not None else os.getenv("OPENROUTER_API_KEY", "")
             if not key:
@@ -78,6 +95,22 @@ class AIStrategy:
                 api_key=key,
                 model=cfg.model,
                 base_url=cfg.api_base_url,
+            )
+            fallbacks: list[OpenRouterClient] = []
+            for fb_model in (cfg.fallback_models or []):
+                fb_model = fb_model.strip()
+                if not fb_model or fb_model == cfg.model:
+                    continue
+                fallbacks.append(OpenRouterClient(
+                    api_key=key, model=fb_model, base_url=cfg.api_base_url,
+                ))
+            self._llm = ResilientLLM(
+                primary=self._client,
+                fallbacks=fallbacks,
+                max_retries=cfg.retry_attempts,
+                retry_base_sec=cfg.retry_base_sec,
+                cb_threshold=cfg.circuit_breaker_threshold,
+                cb_cool_down_sec=cfg.circuit_breaker_cool_down_sec,
             )
 
     # ---- Public API ----
@@ -99,6 +132,7 @@ class AIStrategy:
         daily_pnl: float,
         daily_r: float,
         recent_outcomes: list[dict],
+        workers_by_coin: dict[str, Any] | None = None,
     ) -> AIDecisionResult:
         """Run one decision cycle for a single coin's worker."""
         coin = worker.coin
@@ -139,6 +173,8 @@ class AIStrategy:
             daily_r=daily_r,
             recent_outcomes=recent_outcomes,
             context_bars=self.cfg.context_bars,
+            market_data=self.market_data,
+            workers_by_coin=workers_by_coin,
         )
 
         try:
@@ -182,10 +218,20 @@ class AIStrategy:
         return None
 
     def _call_llm(self, ctx: CoinContext) -> AICallResult:
-        assert self._client is not None
-        return self._client.chat_json(
+        # Prefer the resilient wrapper when available (retries + fallbacks);
+        # fall back to the raw client for older test fixtures.
+        llm = self._llm if self._llm is not None else self._client
+        assert llm is not None
+        # Inject persistent memory into the prompt's recent_outcomes slot.
+        # Falls back to whatever the worker passed in if memory is unset.
+        prompt_dict = ctx.to_prompt_dict()
+        if self.memory is not None:
+            from_memory = self.memory.recent_for_prompt(coin=ctx.coin, limit=10)
+            if from_memory:
+                prompt_dict["recent_outcomes"] = from_memory
+        return llm.chat_json(
             system=SYSTEM_PROMPT,
-            user=build_user_message(ctx.to_prompt_dict()),
+            user=build_user_message(prompt_dict),
             schema=decision_schema(),
             timeout_sec=self.cfg.timeout_sec,
         )
@@ -208,13 +254,8 @@ class AIStrategy:
         if action in {"open_long", "open_short"}:
             sig, err = self._validate_open(coin, ctx, decision)
             if sig is None:
-                return AIDecisionResult(
-                    coin=coin, action="error", signal=None,
-                    reasoning=reasoning, confidence=confidence,
-                    raw_decision=decision, cost_usd=call.cost_usd,
-                    latency_ms=call.latency_ms, model=call.model,
-                    error=err or "invalid_open",
-                )
+                return self._error_result(coin, ctx, call, reasoning, confidence,
+                                          decision, err or "invalid_open")
             return AIDecisionResult(
                 coin=coin, action=action, signal=sig,
                 reasoning=reasoning, confidence=confidence,
@@ -222,7 +263,9 @@ class AIStrategy:
                 latency_ms=call.latency_ms, model=call.model,
             )
 
-        if action in {"close", "hold"}:
+        if action in {"close", "hold", "move_stop_to_breakeven"}:
+            # These actions need an open position (close + move_be) or none (hold);
+            # the bot.py handler decides what to do with each.
             return AIDecisionResult(
                 coin=coin, action=action, signal=None,
                 reasoning=reasoning, confidence=confidence,
@@ -230,12 +273,63 @@ class AIStrategy:
                 latency_ms=call.latency_ms, model=call.model,
             )
 
+        if action == "modify_stop":
+            new_stop = _coerce_optional_float(decision.get("new_stop_price"))
+            if new_stop is None:
+                return self._error_result(coin, ctx, call, reasoning, confidence,
+                                          decision, "missing_new_stop_price")
+            return AIDecisionResult(
+                coin=coin, action=action, signal=None,
+                reasoning=reasoning, confidence=confidence,
+                raw_decision=decision, cost_usd=call.cost_usd,
+                latency_ms=call.latency_ms, model=call.model,
+                new_stop_price=new_stop,
+            )
+
+        if action == "scale_out":
+            frac = _coerce_optional_float(decision.get("scale_fraction"))
+            if frac is None or not (0.0 < frac < 1.0):
+                return self._error_result(coin, ctx, call, reasoning, confidence,
+                                          decision, "invalid_scale_fraction")
+            return AIDecisionResult(
+                coin=coin, action=action, signal=None,
+                reasoning=reasoning, confidence=confidence,
+                raw_decision=decision, cost_usd=call.cost_usd,
+                latency_ms=call.latency_ms, model=call.model,
+                scale_fraction=frac,
+            )
+
+        if action == "add_to_position":
+            sig, err = self._validate_open(coin, ctx, decision)
+            if sig is None:
+                return self._error_result(coin, ctx, call, reasoning, confidence,
+                                          decision, err or "invalid_add")
+            qf = _coerce_optional_float(decision.get("add_qty_fraction"))
+            if qf is None or not (0.0 < qf <= 1.0):
+                return self._error_result(coin, ctx, call, reasoning, confidence,
+                                          decision, "invalid_add_qty_fraction")
+            return AIDecisionResult(
+                coin=coin, action=action, signal=sig,
+                reasoning=reasoning, confidence=confidence,
+                raw_decision=decision, cost_usd=call.cost_usd,
+                latency_ms=call.latency_ms, model=call.model,
+                add_qty_fraction=qf,
+            )
+
+        return self._error_result(coin, ctx, call, reasoning, confidence,
+                                  decision, f"unknown_action:{action!r}")
+
+    def _error_result(
+        self,
+        coin: str, ctx: CoinContext, call: AICallResult,
+        reasoning: str, confidence: float, decision: dict[str, Any], error: str,
+    ) -> AIDecisionResult:
         return AIDecisionResult(
             coin=coin, action="error", signal=None,
             reasoning=reasoning, confidence=confidence,
             raw_decision=decision, cost_usd=call.cost_usd,
             latency_ms=call.latency_ms, model=call.model,
-            error=f"unknown_action:{action!r}",
+            error=error,
         )
 
     def _validate_open(
