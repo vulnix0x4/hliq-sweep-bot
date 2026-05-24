@@ -317,6 +317,6 @@
   <rect x="600" y="1632" width="20" height="14" class="exec-fill"/><text x="630" y="1645" class="legend">Execution</text>
   <rect x="720" y="1632" width="20" height="14" class="store-fill"/><text x="750" y="1645" class="legend">Persistence</text>
   <rect x="850" y="1632" width="20" height="14" class="obs-fill"/><text x="880" y="1645" class="legend">Tooling</text>
-  <text x="1100" y="1645" class="legend">Today: 32 paper trades · 100% WR · +$25.33 net · gates released · live exec NOT BUILT</text>
-  <text x="60" y="1670" class="legend" font-style="italic">Data flow: Hyperliquid WS → Bars → Levels + Detector → Gate Pipeline → PaperOrderManager → Journal → (warm-start on restart, tooling reads)</text>
+  <text x="1100" y="1645" class="legend">Live adapter built · paper/testnet until edge is validated · blocklists available</text>
+  <text x="60" y="1670" class="legend" font-style="italic">Data flow: Hyperliquid WS → Bars → Levels + Detector → Gate Pipeline → Execution manager → Journal → (warm-start on restart, tooling reads)</text>
 </svg>

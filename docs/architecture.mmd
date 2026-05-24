@@ -8,7 +8,7 @@ flowchart TB
   subgraph DataLayer["Data Layer"]
     WSClient["HyperliquidWsClient<br/>data/hyperliquid_ws.py"]
     BarBuilder["BarBuilder<br/>data/bar_builder.py<br/>60s OHLCV bars"]
-    Capture["MarketCaptureWriter<br/>analytics/market_capture.py<br/>3.2 GB JSONL"]
+    Capture["MarketCaptureWriter<br/>analytics/market_capture.py<br/>rotating JSONL"]
   end
 
   subgraph SignalLayer["Signal Layer"]
@@ -21,6 +21,7 @@ flowchart TB
 
   subgraph GatePipeline["Gate Pipeline (signals to allow/block)"]
     Exposure["Exposure / Portfolio cap"]
+    OperatorBlock["Operator blocklists<br/>coin / level / session / side"]
     Funding["Funding blackout (90s before 8h mark)"]
     Micro["Microstructure check<br/>OFI + queue imbalance"]
     SessionGate["Session edge-pause<br/>n>=15, avg_R>-0.40"]
@@ -32,8 +33,8 @@ flowchart TB
     RiskGov["RiskGovernor<br/>risk/governor.py<br/>daily loss limit, hard-loss cooldown,<br/>news spike, vol circuit"]
   end
 
-  subgraph Execution["Execution Layer (paper)"]
-    OrderMgr["PaperOrderManager<br/>execution/order_manager.py<br/>limit entry, fill simulation"]
+  subgraph Execution["Execution Layer"]
+    OrderMgr["PaperOrderManager / HyperliquidOrderManager<br/>paper simulation or gated live adapter"]
     Position["OpenPosition<br/>tracks entry, stop, TP1/TP2,<br/>trailing stop, MFE/MAE"]
     Exits["Exit Decisions<br/>stop_loss / tp1+trail / tp2 /<br/>time_stop 600s / max_hold 1800s /<br/>early_exit / trail_from_entry 0.10"]
   end
@@ -64,7 +65,7 @@ flowchart TB
   %% Signal -> Gate flow
   Detector -->|SweepSignal candidate| Exposure
   Regime --> RegimeBlock
-  Exposure --> Funding --> Micro --> SessionGate --> LevelGate --> SideGate --> RegimeBlock --> Confidence --> MLGate --> RiskGov
+  Exposure --> OperatorBlock --> Funding --> Micro --> SessionGate --> LevelGate --> SideGate --> RegimeBlock --> Confidence --> MLGate --> RiskGov
   RiskGov -->|allowed| OrderMgr
   RiskGov -->|blocked| Journal
 

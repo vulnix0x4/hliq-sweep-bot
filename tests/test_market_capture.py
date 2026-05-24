@@ -61,3 +61,36 @@ def test_loader_backward_compat_reads_rows_without_coin(tmp_path: Path) -> None:
     assert len(events) == 2
     assert events[0].coin == ""
     assert events[1].coin == ""
+
+
+def test_loader_can_skip_legacy_rows_without_coin(tmp_path: Path) -> None:
+    path = tmp_path / "mixed.jsonl"
+    path.write_text(
+        '{"kind":"trade","ts_ms":1700000000000,"price":75000.0,"size":0.01,"side":"buy"}\n'
+        '{"kind":"trade","ts_ms":1700000001000,"coin":"SOL","price":90.0,"size":1.0,"side":"sell"}\n',
+        encoding="utf-8",
+    )
+
+    events = list(load_market_events(str(path), require_coin=True))
+
+    assert len(events) == 1
+    assert events[0].coin == "SOL"
+
+
+def test_capture_rotates_when_file_exceeds_max_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_text("x" * 128, encoding="utf-8")
+    writer = MarketCaptureWriter(path=str(path), max_bytes=64, backups=2)
+
+    writer.write(
+        MarketEvent(
+            kind="trade",
+            ts_ms=1_700_000_000_000,
+            coin="BTC",
+            trade=TradeEvent(ts_ms=1_700_000_000_000, price=75000.0, size=0.01, side="buy"),
+        )
+    )
+
+    assert (tmp_path / "events.jsonl.1").exists()
+    assert path.exists()
+    assert "BTC" in path.read_text(encoding="utf-8")

@@ -65,14 +65,15 @@ class RiskGovernor:
         if raw_notional > max_notional:
             raw_notional = max_notional
             raw_qty = raw_notional / entry_price
+        effective_risk_dollars = raw_qty * stop_distance_abs
 
         if raw_qty < self.risk_cfg.min_qty:
-            return PositionSize(qty=0.0, notional=0.0, risk_dollars=risk_dollars, stop_distance_abs=stop_distance_abs)
+            return PositionSize(qty=0.0, notional=0.0, risk_dollars=0.0, stop_distance_abs=stop_distance_abs)
 
         return PositionSize(
             qty=raw_qty,
             notional=raw_notional,
-            risk_dollars=risk_dollars,
+            risk_dollars=effective_risk_dollars,
             stop_distance_abs=stop_distance_abs,
         )
 

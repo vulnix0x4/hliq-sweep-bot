@@ -9,6 +9,11 @@ from hliq_bot.execution.hyperliquid_order_manager import HyperliquidOrderManager
 from hliq_bot.models import ExecEventType, Side, SweepSignal, TradeEvent
 
 
+@pytest.fixture(autouse=True)
+def _isolated_position_state_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOT_STATE_DIR", str(tmp_path / "active_positions"))
+
+
 def _signal() -> SweepSignal:
     return SweepSignal(
         side=Side.LONG, level=100.0, level_label="prior_15m_low",
@@ -302,6 +307,17 @@ def _live_cfg():
     )
 
 
+def _exchange_with_native_stop(oid: int = 888):
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": oid}}]}},
+    }
+    fake_exchange.bulk_cancel.return_value = {"status": "ok"}
+    fake_exchange.cancel.return_value = {"status": "ok"}
+    return fake_exchange
+
+
 def test_submit_entry_places_post_only_limit(monkeypatch):
     mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
     fake_exchange = MagicMock()
@@ -455,6 +471,96 @@ def test_pending_entry_transitions_to_position_on_fill(monkeypatch):
     assert mgr.position.qty_initial == pytest.approx(0.2, abs=1e-9)
     assert mgr.pending_entry is None
     assert any(u.event_type == ExecEventType.ENTRY_FILLED for u in out2)
+
+
+def test_native_stop_is_placed_after_fill():
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.order.side_effect = [
+        {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 12345}}]}}},
+        {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 67890}}]}}},
+    ]
+    fake_info = MagicMock()
+    fake_info.user_state.return_value = {
+        "assetPositions": [{"position": {"coin": "BTC", "szi": "0.2", "entryPx": "100.0"}}],
+    }
+    mgr._exchange = fake_exchange
+    mgr._info = fake_info
+
+    sig = _signal()
+    mgr.submit_entry(sig, signal_id="abc", qty=0.2, risk_dollars=1.0)
+    mgr.on_trade(TradeEvent(ts_ms=sig.created_ms + 1500, price=100.0, size=1.0))
+
+    assert mgr.position is not None
+    assert mgr.position.native_stop_oid == 67890
+    stop_call = fake_exchange.order.call_args_list[-1].kwargs
+    assert stop_call["name"] == "BTC"
+    assert stop_call["is_buy"] is False
+    assert stop_call["sz"] == pytest.approx(0.2)
+    # limit_px is the trigger price pushed 2% in the adverse direction so a
+    # gap-through can fill. LONG stop = SELL, accepts bids >= limit_px, so
+    # limit must be BELOW the trigger.
+    assert stop_call["limit_px"] == pytest.approx(99.0 * 0.98)
+    assert stop_call["reduce_only"] is True
+    # triggerPx remains exactly the stop price; only limit_px gets the buffer.
+    assert stop_call["order_type"] == {"trigger": {"triggerPx": 99.0, "isMarket": True, "tpsl": "sl"}}
+
+
+def test_native_stop_cancelled_before_full_market_close():
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.001", "avgPx": "99.0"}}]}},
+    }
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=99.0, tp1_price=102.0, tp2_price=104.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        risk_dollars=0.001, coin="BTC", best_price=100.0, worst_price=100.0,
+        native_stop_oid=777,
+    )
+    mgr._native_stop_oid = 777
+
+    mgr.on_trade(TradeEvent(ts_ms=2000, price=98.5, size=1.0))
+
+    fake_exchange.cancel.assert_called_once_with("BTC", 777)
+    fake_exchange.market_close.assert_called_once()
+    assert mgr.position is None
+
+
+def test_native_stop_replaced_when_trail_promotes_stop():
+    mgr = HyperliquidOrderManager(
+        StrategyConfig(trail_from_entry=True, trail_from_entry_factor=0.5),
+        _live_cfg(),
+        coin="BTC",
+    )
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 888}}]}},
+    }
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=99.0, tp1_price=110.0, tp2_price=120.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        risk_dollars=0.001, coin="BTC", best_price=100.0, worst_price=100.0,
+        native_stop_oid=777,
+    )
+    mgr._native_stop_oid = 777
+
+    mgr.on_trade(TradeEvent(ts_ms=2000, price=102.0, size=1.0))
+
+    fake_exchange.cancel.assert_called_once_with("BTC", 777)
+    stop_call = fake_exchange.order.call_args.kwargs
+    assert stop_call["reduce_only"] is True
+    assert stop_call["order_type"]["trigger"]["triggerPx"] == pytest.approx(101.0)
+    assert mgr.position is not None
+    assert mgr.position.native_stop_oid == 888
 
 
 def test_fill_detection_handles_szi_dict_format():
@@ -982,6 +1088,8 @@ def test_reconciles_existing_long_position_on_startup(tmp_path):
         }],
     }
     fake_info.open_orders.return_value = []
+    fake_exchange = _exchange_with_native_stop(oid=777)
+    mgr._exchange = fake_exchange
     mgr._info = fake_info
     mgr.reconcile_on_startup()
     assert mgr.position is not None
@@ -993,6 +1101,8 @@ def test_reconciles_existing_long_position_on_startup(tmp_path):
     # TP1/TP2 disabled (set to entry so they never fire)
     assert mgr.position.tp1_price == 100.0
     assert mgr.position.tp2_price == 100.0
+    assert mgr.position.native_stop_oid == 777
+    fake_exchange.order.assert_called_once()
 
 
 def test_reconciles_existing_short_position_on_startup(tmp_path):
@@ -1006,6 +1116,8 @@ def test_reconciles_existing_short_position_on_startup(tmp_path):
         }],
     }
     fake_info.open_orders.return_value = []
+    fake_exchange = _exchange_with_native_stop(oid=778)
+    mgr._exchange = fake_exchange
     mgr._info = fake_info
     mgr.reconcile_on_startup()
     assert mgr.position is not None
@@ -1013,6 +1125,7 @@ def test_reconciles_existing_short_position_on_startup(tmp_path):
     assert mgr.position.qty_initial == 0.005
     # Tightened wide stop: +0.5% from entry for SHORT
     assert abs(mgr.position.stop_price - 100.5) < 0.01
+    assert mgr.position.native_stop_oid == 778
 
 
 def test_reconcile_no_op_when_no_position():
@@ -1060,6 +1173,8 @@ def test_reconcile_uses_wall_clock_for_opened_ms(monkeypatch):
         "assetPositions": [{"position": {"coin": "BTC", "szi": "0.2", "entryPx": "100.0"}}],
     }
     fake_info.open_orders.return_value = []
+    fake_exchange = _exchange_with_native_stop()
+    mgr._exchange = fake_exchange
     mgr._info = fake_info
 
     # Mock time.time() to a known value
@@ -1068,6 +1183,7 @@ def test_reconcile_uses_wall_clock_for_opened_ms(monkeypatch):
     mgr.reconcile_on_startup()
     assert mgr.position is not None
     assert mgr.position.opened_ms == 1_700_000_000_000  # ms
+    fake_exchange.order.assert_called_once()
 
 
 def test_reconcile_cancels_stale_resting_orders():
@@ -1090,6 +1206,142 @@ def test_reconcile_cancels_stale_resting_orders():
     cancelled = fake_exchange.bulk_cancel.call_args.args[0]
     assert len(cancelled) == 2
     assert all(o["coin"] == "BTC" for o in cancelled)
+
+
+def test_reconcile_preserves_restored_native_stop_and_cancels_other_orders(tmp_path):
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="ETH")
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "ETH.json"
+    _open_position(mgr, qty=0.013, entry=2280, stop=2275)
+    mgr.position.native_stop_oid = 777
+    mgr._native_stop_oid = 777
+    mgr._persist_position()
+    mgr.position = None
+    mgr._native_stop_oid = None
+
+    fake_info = MagicMock()
+    fake_info.user_state.return_value = {
+        "assetPositions": [{"position": {"coin": "ETH", "szi": "0.013", "entryPx": "2280"}}],
+    }
+    fake_info.open_orders.return_value = [
+        {"coin": "ETH", "oid": 777},
+        {"coin": "ETH", "oid": 123},
+    ]
+    fake_exchange = _exchange_with_native_stop(oid=999)
+    mgr._info = fake_info
+    mgr._exchange = fake_exchange
+
+    mgr.reconcile_on_startup()
+
+    assert mgr.position is not None
+    assert mgr.position.native_stop_oid == 777
+    fake_exchange.order.assert_not_called()
+    fake_exchange.bulk_cancel.assert_called_once_with([{"coin": "ETH", "oid": 123}])
+
+
+def test_reconcile_replaces_missing_persisted_native_stop(tmp_path):
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="ETH")
+    mgr._state_dir = tmp_path
+    mgr._state_path = tmp_path / "ETH.json"
+    _open_position(mgr, qty=0.013, entry=2280, stop=2275)
+    mgr.position.native_stop_oid = 777
+    mgr._native_stop_oid = 777
+    mgr._persist_position()
+    mgr.position = None
+    mgr._native_stop_oid = None
+
+    fake_info = MagicMock()
+    fake_info.user_state.return_value = {
+        "assetPositions": [{"position": {"coin": "ETH", "szi": "0.013", "entryPx": "2280"}}],
+    }
+    fake_info.open_orders.return_value = [{"coin": "ETH", "oid": 123}]
+    fake_exchange = _exchange_with_native_stop(oid=999)
+    mgr._info = fake_info
+    mgr._exchange = fake_exchange
+
+    mgr.reconcile_on_startup()
+
+    assert mgr.position is not None
+    assert mgr.position.native_stop_oid == 999
+    fake_exchange.bulk_cancel.assert_called_once_with([{"coin": "ETH", "oid": 123}])
+    fake_exchange.order.assert_called_once()
+
+
+def test_close_failure_reinstalls_native_stop_for_retained_position():
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = _exchange_with_native_stop(oid=888)
+    fake_exchange.market_close.side_effect = ConnectionError("network down")
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=99.0, tp1_price=102.0, tp2_price=104.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        risk_dollars=0.001, coin="BTC", best_price=100.0, worst_price=100.0,
+        native_stop_oid=777,
+    )
+    mgr._native_stop_oid = 777
+
+    updates = mgr.on_trade(TradeEvent(ts_ms=2000, price=98.5, size=1.0))
+
+    assert updates == []
+    assert mgr.position is not None
+    assert mgr.position.native_stop_oid == 888
+    fake_exchange.cancel.assert_called_once_with("BTC", 777)
+    fake_exchange.order.assert_called_once()
+
+
+def test_close_no_fill_reinstalls_native_stop_for_retained_position():
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = _exchange_with_native_stop(oid=889)
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"error": "Reduce only failed"}]}},
+    }
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=99.0, tp1_price=102.0, tp2_price=104.0,
+        opened_ms=1000, qty_initial=0.001, qty_remaining=0.001,
+        risk_dollars=0.001, coin="BTC", best_price=100.0, worst_price=100.0,
+        native_stop_oid=777,
+    )
+    mgr._native_stop_oid = 777
+
+    mgr.on_trade(TradeEvent(ts_ms=2000, price=98.5, size=1.0))
+
+    assert mgr.position is not None
+    assert mgr.position.native_stop_oid == 889
+    fake_exchange.cancel.assert_called_once_with("BTC", 777)
+    fake_exchange.order.assert_called_once()
+
+
+def test_partial_market_close_replaces_stop_for_residual_qty():
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = _exchange_with_native_stop(oid=890)
+    fake_exchange.market_close.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.001", "avgPx": "98.8"}}]}},
+    }
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="abc", side=Side.LONG, entry_price=100.0,
+        stop_price=99.0, tp1_price=102.0, tp2_price=104.0,
+        opened_ms=1000, qty_initial=0.002, qty_remaining=0.002,
+        risk_dollars=0.002, coin="BTC", best_price=100.0, worst_price=100.0,
+        native_stop_oid=777,
+    )
+    mgr._native_stop_oid = 777
+
+    mgr.on_trade(TradeEvent(ts_ms=2000, price=98.5, size=1.0))
+
+    assert mgr.position is not None
+    assert mgr.position.qty_remaining == pytest.approx(0.001)
+    assert mgr.position.native_stop_oid == 890
+    stop_call = fake_exchange.order.call_args.kwargs
+    assert stop_call["sz"] == pytest.approx(0.001)
 
 
 def test_deadman_refresh_pushes_cancel_timer():
@@ -1421,3 +1673,197 @@ def test_persist_position_skips_redundant_writes(tmp_path):
     mgr._persist_position()
     mtime3 = mgr._state_path.stat().st_mtime_ns
     assert mtime3 > mtime2  # written this time
+
+
+# ---- Regression tests for review-driven fixes (2026-05-23) ----
+
+
+def test_native_stop_limit_px_has_slippage_buffer_long():
+    """LONG native stop must place limit_px BELOW triggerPx so a gap-down fills.
+    Regression: limit_px == triggerPx left positions naked on fast adverse moves."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 555}}]}},
+    }
+    mgr._exchange = fake_exchange
+    _open_position(mgr, qty=0.01, entry=100.0, stop=99.0)
+    mgr._place_native_stop()
+    kwargs = fake_exchange.order.call_args.kwargs
+    assert kwargs["is_buy"] is False  # LONG stop sells
+    assert kwargs["limit_px"] < kwargs["order_type"]["trigger"]["triggerPx"]
+    # 2% buffer
+    assert kwargs["limit_px"] == pytest.approx(99.0 * 0.98)
+
+
+def test_native_stop_limit_px_has_slippage_buffer_short():
+    """SHORT native stop must place limit_px ABOVE triggerPx so a gap-up fills."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="ETH")
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 666}}]}},
+    }
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="s", side=Side.SHORT, entry_price=2000.0, stop_price=2020.0,
+        tp1_price=1980.0, tp2_price=1960.0, opened_ms=1_000_000,
+        qty_initial=0.01, qty_remaining=0.01, risk_dollars=0.2,
+        coin="ETH", best_price=2000.0, worst_price=2000.0,
+    )
+    mgr._place_native_stop()
+    kwargs = fake_exchange.order.call_args.kwargs
+    assert kwargs["is_buy"] is True  # SHORT stop buys
+    assert kwargs["limit_px"] > kwargs["order_type"]["trigger"]["triggerPx"]
+    assert kwargs["limit_px"] == pytest.approx(2020.0 * 1.02)
+
+
+def test_native_stop_immediate_fill_clears_position_and_emits_close():
+    """If HL fills the trigger on placement (price already crossed), the bot
+    must realize the close, not store the fill-oid as a live resting stop."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.01", "avgPx": "98.5"}}]}},
+    }
+    mgr._exchange = fake_exchange
+    _open_position(mgr, qty=0.01, entry=100.0, stop=99.0)
+    mgr._place_native_stop()
+    # Position must be cleared; the fill-oid must NOT have become _native_stop_oid.
+    assert mgr.position is None
+    assert mgr._native_stop_oid is None
+    # The close must be drained as an ExecutionUpdate on the next on_trade tick.
+    updates = mgr.on_trade(TradeEvent(ts_ms=2_000_000, price=98.5, size=1.0))
+    close_updates = [u for u in updates if u.event_type == ExecEventType.POSITION_CLOSED]
+    assert len(close_updates) == 1
+    assert close_updates[0].closed_trade is not None
+    assert close_updates[0].closed_trade.exit_reason == "native_stop_immediate_fill"
+
+
+def test_extract_resting_oid_rejects_filled_status():
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    filled_result = {"status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 999}}]}}}
+    resting_result = {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 999}}]}}}
+    assert mgr._extract_resting_oid(filled_result) is None
+    assert mgr._extract_resting_oid(resting_result) == 999
+
+
+def test_ensure_native_stop_retries_per_tick_after_placement_failure():
+    """If the initial native stop placement fails, the per-tick safety net
+    inside _maybe_manage_open_position must retry on every trade tick until it
+    sticks. Regression: previously a failed placement left the position naked
+    indefinitely (only narrow paths called _ensure_native_stop)."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="ETH")
+    fake_exchange = MagicMock()
+    # First call fails (e.g. network blip), second succeeds.
+    fake_exchange.order.side_effect = [
+        Exception("network blip"),
+        {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 7777}}]}}},
+    ]
+    mgr._exchange = fake_exchange
+    from hliq_bot.models import OpenPosition
+    mgr.position = OpenPosition(
+        signal_id="t1", side=Side.LONG, entry_price=2000.0, stop_price=1990.0,
+        tp1_price=2010, tp2_price=2020, opened_ms=1_999_500,  # just-opened
+        qty_initial=0.01, qty_remaining=0.01, risk_dollars=0.1,
+        coin="ETH", best_price=2000.0, worst_price=2000.0,
+    )
+    # First placement fails — _native_stop_oid stays None
+    mgr._place_native_stop()
+    assert mgr._native_stop_oid is None
+    # Next trade tick triggers per-tick retry inside _maybe_manage_open_position.
+    # Price slightly below entry; opened_ms is recent so early_exit/time_stop
+    # paths don't fire.
+    mgr.on_trade(TradeEvent(ts_ms=2_000_000, price=1995.0, size=1.0))
+    assert mgr._native_stop_oid == 7777
+
+
+def test_pending_expiry_promotes_to_position_on_already_filled():
+    """When cancel_by_cloid reports 'already filled', the bot must poll
+    user_state and transition pending_entry → OpenPosition instead of silently
+    clearing pending_entry (which would orphan the position with no stop)."""
+    mgr = HyperliquidOrderManager(StrategyConfig(pending_entry_expiry_sec=10), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.order.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 12345}}]}},
+    }
+    # cancel returns an err-shaped response indicating already-filled
+    fake_exchange.cancel_by_cloid.return_value = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"error": "Order was already filled"}]}},
+    }
+    fake_info = MagicMock()
+    fake_info.user_state.return_value = {
+        "assetPositions": [{"position": {"coin": "BTC", "szi": "0.2", "entryPx": "100.0"}}],
+    }
+    mgr._exchange = fake_exchange
+    mgr._info = fake_info
+    sig = _signal()
+    mgr.submit_entry(sig, signal_id="abc", qty=0.2, risk_dollars=1.0)
+    # Advance past expiry
+    updates = mgr.on_trade(TradeEvent(ts_ms=sig.created_ms + 12_000, price=100.0, size=1.0))
+    # Promoted, not orphaned
+    assert mgr.position is not None
+    assert mgr.pending_entry is None
+    # And we emit an ENTRY_FILLED, not an ORDER_CANCELED
+    filled = [u for u in updates if u.event_type == ExecEventType.ENTRY_FILLED]
+    assert len(filled) == 1
+
+
+def test_cancel_indicates_already_filled_recognizes_top_level_err_string():
+    assert HyperliquidOrderManager._cancel_indicates_already_filled(
+        {"status": "err", "response": "Order was never placed, already canceled, or filled"}
+    )
+    assert HyperliquidOrderManager._cancel_indicates_already_filled(
+        {"status": "ok", "response": {"data": {"statuses": [{"error": "Order already filled"}]}}}
+    )
+    assert HyperliquidOrderManager._cancel_indicates_already_filled(
+        {"status": "ok", "response": {"data": {"statuses": ["success"]}}}
+    ) is False
+
+
+def test_reconcile_preserves_and_adopts_unknown_trigger_sl(tmp_path):
+    """Tier-2 (or Tier-1 with legacy state) must NOT bulk-cancel a live native
+    stop. If we find a reduce-only trigger SL on our coin without recognizing
+    its oid, preserve it AND adopt it as ours."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_exchange.bulk_cancel.return_value = {"status": "ok"}
+    fake_info = MagicMock()
+    fake_info.open_orders.return_value = [
+        # Orphan native stop from a prior run — must be preserved + adopted.
+        {"coin": "BTC", "oid": 4242, "reduceOnly": True, "orderType": "Stop Market"},
+        # Stale entry-side limit — should be cancelled.
+        {"coin": "BTC", "oid": 8888, "reduceOnly": False, "orderType": "Limit"},
+    ]
+    mgr._exchange = fake_exchange
+    mgr._info = fake_info
+    preserved = mgr._cancel_stale_resting_orders("0xdead")
+    assert 4242 in preserved
+    assert 8888 not in preserved
+    assert mgr._native_stop_oid == 4242
+    fake_exchange.bulk_cancel.assert_called_once_with([{"coin": "BTC", "oid": 8888}])
+
+
+def test_reconcile_clears_native_stop_oid_when_open_orders_raises():
+    """If info.open_orders raises during reconcile, we cannot trust that our
+    persisted native_stop_oid is still alive on HL. Clear it so per-tick
+    _ensure_native_stop will force a fresh placement."""
+    mgr = HyperliquidOrderManager(StrategyConfig(), _live_cfg(), coin="BTC")
+    fake_exchange = MagicMock()
+    fake_info = MagicMock()
+    fake_info.open_orders.side_effect = Exception("network blip")
+    mgr._exchange = fake_exchange
+    mgr._info = fake_info
+    _open_position(mgr)
+    mgr._native_stop_oid = 1234
+    mgr.position.native_stop_oid = 1234
+    result = mgr._cancel_stale_resting_orders("0xdead", preserve_oids={1234})
+    assert result is None
+    # Stale oid cleared — per-tick retry will re-place
+    assert mgr._native_stop_oid is None
+    assert mgr.position.native_stop_oid is None

@@ -14,4 +14,30 @@ services:
     command:
       - sh
       - -lc
-      - mkdir -p /app/runtime && python -m hliq_bot.main 2>&1 | tee -a /app/runtime/bot.log
+      - |
+        mkdir -p /app/runtime
+        max="$${BOT_LOG_MAX_BYTES:-52428800}"
+        if [ -f /app/runtime/bot.log ] && [ "$$(wc -c < /app/runtime/bot.log)" -gt "$$max" ]; then
+          mv /app/runtime/bot.log "/app/runtime/bot.log.$$(date +%Y%m%d%H%M%S)"
+        fi
+        if [ -s /app/runtime/us_profit_watch.log ]; then
+          mv /app/runtime/us_profit_watch.log "/app/runtime/us_profit_watch.log.$$(date +%Y%m%d%H%M%S)"
+        fi
+        while true; do
+          python /app/scripts/session_profit_watch.py \
+            --loop \
+            --max-wait-sec 86400 \
+            --timeout-sec 28800 \
+            --poll-sec 30 \
+            --edge-min-session-trades "$${BOT_EDGE_MIN_SESSION_TRADES:-2}" \
+            --edge-min-coin-trades "$${BOT_EDGE_MIN_COIN_TRADES:-5}" \
+            --edge-min-level-trades "$${BOT_EDGE_MIN_LEVEL_TRADES:-2}"
+          rc="$$?"
+          if [ "$$rc" -eq 0 ]; then
+            echo "Session profit watcher completed successfully."
+            break
+          fi
+          echo "Session profit watcher exited $$rc; restarting in 30s."
+          sleep 30
+        done >> /app/runtime/us_profit_watch.log 2>&1 &
+        python -m hliq_bot.main 2>&1 | tee -a /app/runtime/bot.log

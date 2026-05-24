@@ -6,7 +6,7 @@ import sys
 
 from hliq_bot.bot import SweepBot
 from hliq_bot.config import AppConfig, FeedConfig, LevelConfig, LiveConfig, ReplayConfig, RiskConfig, RuntimeConfig, StrategyConfig
-from hliq_bot.models import MarketEvent, Side, TradeEvent
+from hliq_bot.models import MarketEvent, Side, SweepSignal, TradeEvent
 
 
 def _app_config(tmp_path: Path) -> AppConfig:
@@ -20,6 +20,7 @@ def _app_config(tmp_path: Path) -> AppConfig:
         runtime=RuntimeConfig(
             runtime_dir=str(runtime_dir),
             journal_path=str(runtime_dir / "signals.jsonl"),
+            run_id="test-run",
             ml_state_path=str(runtime_dir / "ml_state.json"),
             ml_model_path=str(runtime_dir / "models" / "gate_model.json"),
         ),
@@ -52,6 +53,98 @@ def test_signal_quality_mult_mapping() -> None:
     assert mult(5.0) == 1.2
 
 
+def test_bars_from_candles_parses_hyperliquid_rows() -> None:
+    rows = [
+        {
+            "t": 1_000,
+            "T": 60_999,
+            "s": "SOL",
+            "i": "1m",
+            "o": "97.10",
+            "c": "97.20",
+            "h": "97.30",
+            "l": "97.00",
+            "v": "123.45",
+            "n": 17,
+        },
+        {"t": 500, "o": "0", "c": "0", "h": "0", "l": "0"},
+    ]
+
+    bars = SweepBot._bars_from_candles(rows)
+
+    assert len(bars) == 1
+    assert bars[0].start_ms == 1_000
+    assert bars[0].end_ms == 60_999
+    assert bars[0].open == 97.10
+    assert bars[0].high == 97.30
+    assert bars[0].low == 97.00
+    assert bars[0].close == 97.20
+    assert bars[0].volume == 123.45
+    assert bars[0].trade_count == 17
+
+
+def test_policy_log_summary_includes_operator_and_fee_fields(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    cfg.strategy.allowed_coins_str = "BTC"
+    cfg.strategy.allowed_level_labels_str = "prior_15m_low"
+    cfg.strategy.allowed_coin_level_pairs_str = "BTC:prior_15m_low"
+    cfg.strategy.allowed_sessions_str = "us"
+    cfg.strategy.allowed_sides_str = "long"
+    bot = SweepBot(cfg)
+
+    summary = bot._policy_log_summary()
+
+    assert summary["allow_coins"] == ["BTC"]
+    assert summary["allow_levels"] == ["prior_15m_low"]
+    assert summary["allow_coin_levels"] == ["BTC:prior_15m_low"]
+    assert summary["allow_sessions"] == ["us"]
+    assert summary["allow_sides"] == ["long"]
+    assert summary["maker_fee_pct"] == cfg.strategy.maker_fee_pct
+    assert summary["paper_exit_slippage_bps"] == cfg.strategy.paper_exit_slippage_bps
+
+
+def test_warm_start_history_seeds_worker_state(tmp_path: Path, monkeypatch) -> None:
+    cfg = _app_config(tmp_path)
+    cfg.runtime.history_warm_start_enabled = True
+    cfg.runtime.history_warm_start_bars = 20
+
+    bot = SweepBot(cfg)
+
+    candles = [
+        {
+            "t": 1778541000000 + i * 60_000,
+            "T": 1778541059999 + i * 60_000,
+            "o": str(97.0 + i * 0.01),
+            "h": str(97.02 + i * 0.01),
+            "l": str(96.98 + i * 0.01),
+            "c": str(97.01 + i * 0.01),
+            "v": "10",
+            "n": 3,
+        }
+        for i in range(20)
+    ]
+
+    class _Info:
+        def __init__(self, _api_url, skip_ws):
+            self.skip_ws = skip_ws
+
+        def candles_snapshot(self, coin, interval, start_ms, end_ms):
+            assert coin == "BTC"
+            assert interval == "1m"
+            assert start_ms < end_ms
+            return candles
+
+    monkeypatch.setattr("hyperliquid.info.Info", _Info)
+
+    bot._warm_start_history()
+
+    worker = bot._first_worker
+    assert len(worker.recent_closes) > 0
+    assert worker.recent_closes[-1] == 97.20
+    assert worker.session_tracker.current_session is not None
+    assert worker.vwap_tracker.vwap > 0
+
+
 def test_warmup_micro_softpass_allows_one_signal_side(tmp_path: Path) -> None:
     cfg = _app_config(tmp_path)
     cfg.strategy.warmup_enabled = True
@@ -74,8 +167,8 @@ def test_warmup_micro_softpass_allows_one_signal_side(tmp_path: Path) -> None:
     assert "micro_softpass" in check.reason
 
 
-def test_non_warmup_or_logic_allows_single_signal(tmp_path: Path) -> None:
-    """OR logic is now always active, so a single passing signal suffices outside warmup."""
+def test_non_warmup_requires_flow_and_queue(tmp_path: Path) -> None:
+    """Outside warmup, micro confirmation requires both flow and queue alignment."""
     cfg = _app_config(tmp_path)
     cfg.strategy.warmup_enabled = True
     cfg.strategy.warmup_target_resolved = 1
@@ -92,8 +185,8 @@ def test_non_warmup_or_logic_allows_single_signal(tmp_path: Path) -> None:
     bot._recent_signed_flow.extend([(1_000, -5.0), (2_000, -8.0)])
 
     check = bot._microstructure_check(Side.LONG)
-    assert check.allowed is True
-    assert "micro_softpass" in check.reason
+    assert check.allowed is False
+    assert "micro_ofi_fail" in check.reason
 
 
 def test_auto_train_uses_local_paths_and_persists_state(tmp_path: Path, monkeypatch) -> None:
@@ -165,7 +258,30 @@ def test_run_replay_updates_summary_without_live_clock(tmp_path: Path) -> None:
     assert int(summary["bars_closed"]) == 1
 
 
-def test_micro_softpass_outside_warmup(tmp_path: Path) -> None:
+def test_bot_journals_run_start_and_context(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    bot = SweepBot(cfg)
+    bot.journal.write("decision", "sig-1", {"ts_ms": 123, "allowed": False, "reason": "test"})
+
+    rows = [
+        json.loads(line)
+        for line in Path(cfg.runtime.journal_path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    run_rows = [row for row in rows if row.get("event_type") == "run"]
+    assert len(run_rows) == 1
+    assert run_rows[0]["signal_id"] == "test-run"
+    assert run_rows[0]["run_id"] == "test-run"
+    assert run_rows[0]["mode"] == "paper"
+    assert run_rows[0]["event"] == "run_start"
+
+    decision = rows[-1]
+    assert decision["event_type"] == "decision"
+    assert decision["run_id"] == "test-run"
+    assert decision["mode"] == "paper"
+
+
+def test_micro_single_signal_fails_outside_warmup(tmp_path: Path) -> None:
     cfg = _app_config(tmp_path)
     cfg.strategy.warmup_enabled = True
     cfg.strategy.warmup_target_resolved = 5
@@ -181,8 +297,8 @@ def test_micro_softpass_outside_warmup(tmp_path: Path) -> None:
     bot._recent_signed_flow.extend([(1_000, -5.0), (2_000, -8.0)])
 
     check = bot._microstructure_check(Side.LONG)
-    assert check.allowed is True
-    assert "micro_softpass" in check.reason
+    assert check.allowed is False
+    assert "micro_ofi_fail" in check.reason
 
 
 def test_bot_creates_session_and_vwap_trackers(tmp_path: Path) -> None:
@@ -436,6 +552,19 @@ def test_min_signal_score_default_disabled(tmp_path: Path) -> None:
     assert bot.cfg.strategy.min_signal_score == 0.0
 
 
+def test_runtime_pause_reason_uses_pause_file(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    pause_path = Path(cfg.runtime.runtime_dir) / "trade_pause.flag"
+    cfg.runtime.trade_pause_path = str(pause_path)
+    bot = SweepBot(cfg)
+
+    assert bot._runtime_pause_reason() is None
+
+    pause_path.write_text("edge_check_pending\nsecond line ignored\n", encoding="utf-8")
+
+    assert bot._runtime_pause_reason() == "runtime_pause:edge_check_pending"
+
+
 def test_regime_filter_disabled_by_default(tmp_path: Path) -> None:
     """Regime filter must default OFF so existing behavior is preserved."""
     cfg = _app_config(tmp_path)
@@ -453,6 +582,203 @@ def test_regime_filter_config_fields(tmp_path: Path) -> None:
     assert bot.cfg.strategy.regime_filter_enabled is True
     assert bot.cfg.strategy.regime_filter_ma_bars == 20
     assert bot.cfg.strategy.regime_filter_threshold_pct == 0.6
+
+
+def test_operator_blocklist_blocks_bad_slices(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    cfg.strategy.blocked_coins_str = "ETH"
+    cfg.strategy.blocked_level_labels_str = "prior_15m_low,equal_low_*"
+    cfg.strategy.blocked_sessions_str = "asia,eu,late"
+    bot = SweepBot(cfg)
+
+    sig = SweepSignal(
+        side=Side.LONG,
+        level=100.0,
+        level_label="vwap_daily",
+        sweep_extreme=99.0,
+        entry_price=100.0,
+        stop_price=99.0,
+        tp1_price=101.0,
+        tp2_price=102.0,
+        confidence=0.8,
+        reason="test",
+        created_ms=1,
+    )
+
+    assert bot._operator_blocklist_check("ETH", sig, "us") == ("block_coin", "block_coin:ETH")
+    assert bot._operator_blocklist_check("BTC", sig, "asia") == ("block_session", "block_session:asia")
+    sig.level_label = "prior_15m_low"
+    assert bot._operator_blocklist_check("BTC", sig, "us") == ("block_level", "block_level:prior_15m_low")
+    sig.level_label = "equal_low_17"
+    assert bot._operator_blocklist_check("BTC", sig, "us") == ("block_level", "block_level:equal_low_17")
+
+
+def test_operator_allowlist_restricts_unapproved_slices(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    cfg.strategy.allowed_coins_str = "SOL"
+    cfg.strategy.allowed_level_labels_str = "session_open_current,equal_high_*"
+    cfg.strategy.allowed_sessions_str = "us"
+    cfg.strategy.allowed_sides_str = "long,short"
+    bot = SweepBot(cfg)
+
+    sig = SweepSignal(
+        side=Side.LONG,
+        level=100.0,
+        level_label="session_open_current",
+        sweep_extreme=99.0,
+        entry_price=100.0,
+        stop_price=99.0,
+        tp1_price=101.0,
+        tp2_price=102.0,
+        confidence=0.8,
+        reason="test",
+        created_ms=1,
+    )
+
+    assert bot._operator_blocklist_check("SOL", sig, "us") is None
+    assert bot._operator_blocklist_check("BTC", sig, "us") == ("allow_coin_miss", "allow_coin_miss:BTC")
+    assert bot._operator_blocklist_check("SOL", sig, "asia") == ("allow_session_miss", "allow_session_miss:asia")
+    sig.level_label = "prior_15m_low"
+    assert bot._operator_blocklist_check("SOL", sig, "us") == ("allow_level_miss", "allow_level_miss:prior_15m_low")
+
+
+def test_operator_coin_level_pair_allowlist_restricts_coin_specific_levels(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    cfg.strategy.allowed_coins_str = "BTC,HYPE"
+    cfg.strategy.allowed_level_labels_str = "equal_low_*,prior_15m_low"
+    cfg.strategy.allowed_coin_level_pairs_str = "BTC:prior_15m_low,HYPE:equal_low_*"
+    cfg.strategy.allowed_sessions_str = "us"
+    cfg.strategy.allowed_sides_str = "long"
+    bot = SweepBot(cfg)
+
+    sig = SweepSignal(
+        side=Side.LONG,
+        level=100.0,
+        level_label="prior_15m_low",
+        sweep_extreme=99.0,
+        entry_price=100.0,
+        stop_price=99.0,
+        tp1_price=101.0,
+        tp2_price=102.0,
+        confidence=0.8,
+        reason="test",
+        created_ms=1,
+    )
+
+    assert bot._operator_blocklist_check("BTC", sig, "us") is None
+    assert bot._operator_blocklist_check("HYPE", sig, "us") == (
+        "allow_coin_level_miss",
+        "allow_coin_level_miss:HYPE:prior_15m_low",
+    )
+    sig.level_label = "equal_low_42"
+    assert bot._operator_blocklist_check("HYPE", sig, "us") is None
+
+
+def test_operator_coin_session_pair_allowlist_restricts_coin_specific_sessions(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    cfg.strategy.allowed_coins_str = "BTC,LINK"
+    cfg.strategy.allowed_level_labels_str = "equal_low_*,prior_15m_low"
+    cfg.strategy.allowed_coin_session_pairs_str = "BTC:us,LINK:asia,LINK:eu"
+    cfg.strategy.allowed_sessions_str = "asia,eu,us"
+    cfg.strategy.allowed_sides_str = "long"
+    bot = SweepBot(cfg)
+
+    sig = SweepSignal(
+        side=Side.LONG,
+        level=100.0,
+        level_label="prior_15m_low",
+        sweep_extreme=99.0,
+        entry_price=100.0,
+        stop_price=99.0,
+        tp1_price=101.0,
+        tp2_price=102.0,
+        confidence=0.8,
+        reason="test",
+        created_ms=1,
+    )
+
+    assert bot._operator_blocklist_check("BTC", sig, "us") is None
+    assert bot._operator_blocklist_check("BTC", sig, "asia") == (
+        "allow_coin_session_miss",
+        "allow_coin_session_miss:BTC:asia",
+    )
+    assert bot._operator_blocklist_check("LINK", sig, "asia") is None
+    assert bot._operator_blocklist_check("LINK", sig, "us") == (
+        "allow_coin_session_miss",
+        "allow_coin_session_miss:LINK:us",
+    )
+
+
+def test_operator_coin_session_level_allowlist_restricts_exact_combo(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    cfg.strategy.allowed_coins_str = "HYPE"
+    cfg.strategy.allowed_level_labels_str = "equal_low_*,equal_high_*"
+    cfg.strategy.allowed_coin_level_pairs_str = "HYPE:equal_low_*,HYPE:equal_high_*"
+    cfg.strategy.allowed_coin_session_pairs_str = "HYPE:asia,HYPE:us"
+    cfg.strategy.allowed_coin_session_level_triples_str = "HYPE:asia:equal_high_*,HYPE:us:equal_low_*"
+    cfg.strategy.allowed_sessions_str = "asia,us"
+    cfg.strategy.allowed_sides_str = "long,short"
+    bot = SweepBot(cfg)
+
+    sig = SweepSignal(
+        side=Side.SHORT,
+        level=100.0,
+        level_label="equal_high_1",
+        sweep_extreme=101.0,
+        entry_price=100.0,
+        stop_price=101.0,
+        tp1_price=99.0,
+        tp2_price=98.0,
+        confidence=0.8,
+        reason="test",
+        created_ms=1,
+    )
+
+    assert bot._operator_blocklist_check("HYPE", sig, "asia") is None
+    assert bot._operator_blocklist_check("HYPE", sig, "us") == (
+        "allow_coin_session_level_miss",
+        "allow_coin_session_level_miss:HYPE:us:equal_high_1",
+    )
+    sig.level_label = "equal_low_1"
+    assert bot._operator_blocklist_check("HYPE", sig, "us") is None
+    assert bot._operator_blocklist_check("HYPE", sig, "asia") == (
+        "allow_coin_session_level_miss",
+        "allow_coin_session_level_miss:HYPE:asia:equal_low_1",
+    )
+
+
+def test_deadman_refresh_skips_flat_workers(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    cfg.feed.coins_str = "BTC,ETH"
+    bot = SweepBot(cfg)
+
+    class _Exec:
+        def __init__(self, exposure: bool) -> None:
+            self.exposure = exposure
+            self.checked = 0
+            self.refreshed = 0
+
+        def has_exposure(self) -> bool:
+            return self.exposure
+
+        def should_refresh_deadman(self, now_ms: int) -> bool:
+            self.checked += 1
+            return True
+
+        def refresh_deadman(self, now_ms: int) -> None:
+            self.refreshed += 1
+
+    flat = _Exec(False)
+    exposed = _Exec(True)
+    bot._workers["BTC"].executor = flat
+    bot._workers["ETH"].executor = exposed
+
+    bot._maybe_refresh_deadmans(1_000_000)
+
+    assert flat.checked == 0
+    assert flat.refreshed == 0
+    assert exposed.checked == 1
+    assert exposed.refreshed == 1
 
 
 def test_regime_filter_logic_blocks_long_in_downtrend(tmp_path: Path) -> None:

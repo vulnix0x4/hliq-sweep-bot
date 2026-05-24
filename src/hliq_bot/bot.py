@@ -2,6 +2,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import fnmatch
 import json
 import logging
 from pathlib import Path
@@ -19,7 +20,7 @@ from hliq_bot.data.bar_builder import BarBuilder
 from hliq_bot.data.hyperliquid_ws import HyperliquidWsClient
 from hliq_bot.execution.order_manager import PaperOrderManager
 from hliq_bot.ml.gate import MLGate
-from hliq_bot.models import ClosedTrade, ExecEventType, MarketEvent, MarketState, RiskCheck, Side, SweepSignal
+from hliq_bot.models import Bar, ClosedTrade, ExecEventType, MarketEvent, MarketState, RiskCheck, Side, SweepSignal
 from hliq_bot.risk.governor import RiskGovernor
 from hliq_bot.signal.regime import Regime, RegimeState, classify_regime
 from hliq_bot.signal.session_tracker import SessionTracker
@@ -27,6 +28,28 @@ from hliq_bot.signal.sweep_detector import SweepDetector
 from hliq_bot.signal.vwap_tracker import VWAPTracker
 
 log = logging.getLogger(__name__)
+
+
+def _matches_block_pattern(value: str, patterns: set[str]) -> bool:
+    value = value.strip()
+    if not value:
+        return False
+    return any(fnmatch.fnmatchcase(value, pattern) for pattern in patterns)
+
+
+def _matches_coin_level_pair(coin: str, level: str, patterns: set[str]) -> bool:
+    pair = f"{coin.strip().upper()}:{level.strip().lower()}"
+    return _matches_block_pattern(pair, patterns)
+
+
+def _matches_coin_session_pair(coin: str, session: str, patterns: set[str]) -> bool:
+    pair = f"{coin.strip().upper()}:{session.strip().lower()}"
+    return _matches_block_pattern(pair, patterns)
+
+
+def _matches_coin_session_level_triple(coin: str, session: str, level: str, patterns: set[str]) -> bool:
+    triple = f"{coin.strip().upper()}:{session.strip().lower()}:{level.strip().lower()}"
+    return _matches_block_pattern(triple, patterns)
 
 
 def _make_executor(config: AppConfig, coin: str):
@@ -82,12 +105,20 @@ class SweepBot:
         self._project_root = self._detect_project_root()
         self._normalize_runtime_paths()
         self._load_runtime_ml_state()
+        self.run_id = self._make_run_id(config, int(time.time() * 1000))
         self.feed = HyperliquidWsClient(config.feed)
         self.risk = RiskGovernor(config.risk, config.strategy)
         self.ml_gate = MLGate(config.runtime)
-        self.journal = SignalJournal(config.runtime.journal_path)
+        self.journal = SignalJournal(
+            config.runtime.journal_path,
+            default_context={"run_id": self.run_id, "mode": config.mode},
+        )
         self.capture = (
-            MarketCaptureWriter(config.runtime.market_capture_path)
+            MarketCaptureWriter(
+                config.runtime.market_capture_path,
+                max_bytes=config.runtime.market_capture_max_bytes,
+                backups=config.runtime.market_capture_backups,
+            )
             if config.runtime.market_capture_enabled
             else None
         )
@@ -95,7 +126,14 @@ class SweepBot:
 
         # Build per-coin workers
         range_maxlen = max(3, config.strategy.circuit_range_bars + 3)
-        closes_maxlen = max(5, config.strategy.trend_lookback_bars + 5)
+        # recent_closes must hold enough history for BOTH the trend filter and
+        # the regime MA. Sizing only on trend_lookback_bars made the regime
+        # filter a silent no-op at defaults (deque=25 but ma_bars=30).
+        closes_maxlen = max(
+            5,
+            config.strategy.trend_lookback_bars + 5,
+            config.strategy.regime_filter_ma_bars + 5 if config.strategy.regime_filter_enabled else 0,
+        )
         self._workers: dict[str, CoinWorker] = {}
         for coin in config.feed.coins:
             st = SessionTracker()
@@ -140,6 +178,7 @@ class SweepBot:
         self._last_event_ms = 0
         self._heartbeat_interval_ms = 60_000
         now_ms = self._now_ms()
+        self._write_run_start(now_ms)
         self._last_heartbeat_ms = now_ms
         self._trade_events = 0
         self._book_events = 0
@@ -311,7 +350,19 @@ class SweepBot:
                     if side is None:
                         continue
 
-                    implied_risk = abs(pnl) / max(abs(r_mult), 1e-6) if abs(r_mult) > 1e-6 else 1.0
+                    # Prefer the explicit risk_dollars on the row (schema >=2).
+                    # Legacy rows didn't journal it, so derive from pnl/r_mult.
+                    # The legacy derivation is fragile (fails on pnl=0, drops
+                    # precision) so the explicit field is strongly preferred.
+                    explicit_risk = self._parse_float(row.get("risk_dollars"))
+                    if explicit_risk is not None and explicit_risk > 0:
+                        derived_risk = explicit_risk
+                    else:
+                        derived_risk = (
+                            abs(pnl) / max(abs(r_mult), 1e-6)
+                            if abs(r_mult) > 1e-6
+                            else 1.0
+                        )
                     trade = ClosedTrade(
                         signal_id=sid,
                         side=side,
@@ -319,7 +370,7 @@ class SweepBot:
                         exit_price=0.0,
                         qty=0.0,
                         pnl=pnl,
-                        risk_dollars=max(implied_risk, 1e-6),
+                        risk_dollars=max(derived_risk, 1e-6),
                         r_multiple=r_mult,
                         opened_ms=max(0, ts_ms - 1),
                         closed_ms=ts_ms,
@@ -396,10 +447,50 @@ class SweepBot:
         rt = self.cfg.runtime
         rt.runtime_dir = str(self._resolve_project_path(rt.runtime_dir))
         rt.journal_path = str(self._resolve_project_path(rt.journal_path))
+        rt.trade_pause_path = str(self._resolve_project_path(rt.trade_pause_path))
         rt.market_capture_path = str(self._resolve_project_path(rt.market_capture_path))
         rt.ml_model_path = str(self._resolve_project_path(rt.ml_model_path))
         rt.ml_state_path = str(self._resolve_project_path(rt.ml_state_path))
         self.cfg.replay.input_path = str(self._resolve_project_path(self.cfg.replay.input_path))
+
+    def _runtime_pause_reason(self) -> str | None:
+        path = Path(self.cfg.runtime.trade_pause_path)
+        if not path.exists():
+            return None
+        try:
+            detail = path.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+        except OSError:
+            detail = []
+        reason = detail[0].strip() if detail else "operator_pause"
+        reason = reason[:120] or "operator_pause"
+        return f"runtime_pause:{reason}"
+
+    def _clear_stale_edge_check_pause(self) -> None:
+        """Delete trade_pause.flag at startup IF it was written by a watcher's
+        edge_check_pending phase. A bot startup implies the watcher either
+        (a) started too and will re-write its flag, or (b) crashed mid-check —
+        in either case the stale "pending" flag should not silently halt trading.
+
+        Operator-set pauses (any other reason string) AND "edge_check_failed"
+        flags are preserved: those are legitimate signals to keep trading off.
+        """
+        path = Path(self.cfg.runtime.trade_pause_path)
+        if not path.exists():
+            return
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return
+        first = content.splitlines()[0].strip() if content else ""
+        if first == "edge_check_pending":
+            try:
+                path.unlink()
+                log.warning(
+                    "Cleared stale edge_check_pending pause flag at startup (likely from a "
+                    "crashed session_profit_watch). Watcher will re-write if still needed."
+                )
+            except OSError as exc:
+                log.warning("Could not clear stale pause flag %s: %s", path, exc)
 
     def _load_runtime_ml_state(self) -> None:
         path = self._resolve_project_path(self.cfg.runtime.ml_state_path)
@@ -429,12 +520,39 @@ class SweepBot:
         except Exception as exc:
             log.warning("Failed to persist runtime ML state: %s", exc)
 
+    def _policy_log_summary(self) -> dict[str, object]:
+        s = self.cfg.strategy
+        return {
+            "allow_coins": sorted(s.allowed_coins),
+            "allow_levels": sorted(s.allowed_level_labels),
+            "allow_coin_levels": sorted(s.allowed_coin_level_pairs),
+            "allow_coin_sessions": sorted(s.allowed_coin_session_pairs),
+            "allow_coin_session_levels": sorted(s.allowed_coin_session_level_triples),
+            "allow_sessions": sorted(s.allowed_sessions),
+            "allow_sides": sorted(s.allowed_sides),
+            "block_coins": sorted(s.blocked_coins),
+            "block_levels": sorted(s.blocked_level_labels),
+            "block_coin_levels": sorted(s.blocked_coin_level_pairs),
+            "block_coin_sessions": sorted(s.blocked_coin_session_pairs),
+            "block_coin_session_levels": sorted(s.blocked_coin_session_level_triples),
+            "block_sessions": sorted(s.blocked_sessions),
+            "block_sides": sorted(s.blocked_sides),
+            "min_signal_score": s.min_signal_score,
+            "min_conf_range": s.min_confidence_range,
+            "maker_fee_pct": s.maker_fee_pct,
+            "taker_fee_pct": s.taker_fee_pct,
+            "paper_entry_slippage_bps": s.paper_entry_slippage_bps,
+            "paper_exit_slippage_bps": s.paper_exit_slippage_bps,
+            "paper_tp1_is_taker": s.paper_tp1_is_taker,
+        }
+
     async def run(self) -> None:
         log.info(
             (
-                "Starting sweep bot mode=%s coins=%s timeframe=%ss ml_enabled=%s ml_mode=%s ml_provider=%s "
+                "Starting sweep bot run_id=%s mode=%s coins=%s timeframe=%ss ml_enabled=%s ml_mode=%s ml_provider=%s "
                 "ml_auto_train=%s interval=%ss min_resolved=%d min_new=%d warmup=%s target=%d journal=%s capture=%s"
             ),
+            self.run_id,
             self.cfg.mode,
             self.cfg.feed.coins,
             self.cfg.strategy.timeframe_sec,
@@ -450,6 +568,25 @@ class SweepBot:
             self.cfg.runtime.journal_path,
             self.cfg.runtime.market_capture_path if self.capture is not None else "disabled",
         )
+        log.info("Active operator policy: %s", json.dumps(self._policy_log_summary(), sort_keys=True))
+        # Surface micro-check mode so operators are not surprised by low admission rate.
+        # Outside warmup, soft_or is False -> every signal requires BOTH OFI and queue-imbalance
+        # to clear; combined with min_signal_score / regime filters / allowlists this stacks.
+        s = self.cfg.strategy
+        soft_or_active = s.warmup_enabled and s.warmup_micro_or_logic
+        log.info(
+            "Microstructure gating: warmup_enabled=%s warmup_micro_or_logic=%s -> "
+            "soft_or=%s (False means OFI AND queue-imbalance must BOTH clear; "
+            "low admission is expected). regime_filter=%s min_signal_score=%.2f",
+            s.warmup_enabled, s.warmup_micro_or_logic, soft_or_active,
+            s.regime_filter_enabled, s.min_signal_score,
+        )
+        # Defensive: a stale trade_pause.flag from a crashed watcher would
+        # silently halt the bot. If the flag exists at startup AND was written
+        # by the watcher's edge_check_pending path, treat it as stale and clear
+        # it. Operator-set pauses (any other content) are preserved.
+        self._clear_stale_edge_check_pause()
+        self._warm_start_history()
         stop_flag = threading.Event()
         worker = threading.Thread(target=self._event_worker, args=(stop_flag,), name="sweepbot-worker", daemon=True)
         worker.start()
@@ -463,6 +600,103 @@ class SweepBot:
         finally:
             stop_flag.set()
             worker.join(timeout=5.0)
+
+    def _warm_start_history(self) -> None:
+        if not self.cfg.runtime.history_warm_start_enabled:
+            return
+        interval = self._candle_interval()
+        if not interval:
+            log.warning(
+                "History warm-start skipped: unsupported timeframe_sec=%s",
+                self.cfg.strategy.timeframe_sec,
+            )
+            return
+        try:
+            from hyperliquid.info import Info
+            from hyperliquid.utils import constants
+
+            feed_url = self.cfg.feed.ws_url.lower()
+            api_url = constants.TESTNET_API_URL if "testnet" in feed_url else constants.MAINNET_API_URL
+            info = Info(api_url, skip_ws=True)
+        except Exception as exc:
+            log.warning("History warm-start skipped: Hyperliquid SDK unavailable: %s", exc)
+            return
+
+        bars_requested = max(20, int(self.cfg.runtime.history_warm_start_bars))
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - (bars_requested + 5) * self.cfg.strategy.timeframe_sec * 1000
+        for coin, worker in self._workers.items():
+            try:
+                raw = info.candles_snapshot(coin, interval, start_ms, end_ms)
+                bars = self._bars_from_candles(raw)
+            except Exception as exc:
+                log.warning("History warm-start failed for %s: %s", coin, exc)
+                continue
+            if not bars:
+                log.warning("History warm-start found no candles for %s", coin)
+                continue
+            seeded = worker.detector.seed_history(bars)
+            for bar in bars:
+                worker.recent_bar_ranges.append(bar.range_pct)
+                worker.recent_closes.append(bar.close)
+                worker.session_tracker.on_bar(bar)
+                worker.vwap_tracker.on_bar(bar)
+            log.info(
+                "History warm-start seeded %d %s candles for %s range_close=%.4f..%.4f",
+                seeded,
+                interval,
+                coin,
+                bars[0].close,
+                bars[-1].close,
+            )
+
+    def _candle_interval(self) -> str:
+        mapping = {
+            60: "1m",
+            180: "3m",
+            300: "5m",
+            900: "15m",
+            1800: "30m",
+            3600: "1h",
+        }
+        return mapping.get(int(self.cfg.strategy.timeframe_sec), "")
+
+    @staticmethod
+    def _bars_from_candles(candles: object) -> list[Bar]:
+        if not isinstance(candles, list):
+            return []
+        bars: list[Bar] = []
+        for row in candles:
+            if not isinstance(row, dict):
+                continue
+            try:
+                start_ms = int(row["t"])
+                end_ms = int(row.get("T", start_ms + 60_000))
+                open_px = float(row["o"])
+                high = float(row["h"])
+                low = float(row["l"])
+                close = float(row["c"])
+                volume = float(row.get("v", 0.0))
+                trades = int(row.get("n", 0))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if open_px <= 0 or high <= 0 or low <= 0 or close <= 0 or high < low:
+                continue
+            bars.append(
+                Bar(
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    open=open_px,
+                    high=high,
+                    low=low,
+                    close=close,
+                    volume=max(0.0, volume),
+                    trade_count=max(0, trades),
+                    vwap=close,
+                    avg_spread_bps=0.0,
+                )
+            )
+        return sorted(bars, key=lambda b: b.start_ms)
 
     def run_replay(self, events) -> dict[str, float | int]:
         log.info(
@@ -635,6 +869,15 @@ class SweepBot:
                         "pnl_gross": update.closed_trade.pnl_gross,
                         "fees_paid": update.closed_trade.fees_paid,
                         "r_multiple": update.closed_trade.r_multiple,
+                        # Explicit risk denominator + schema version so restore
+                        # reads the exact value used to compute r_multiple,
+                        # instead of deriving abs(pnl)/abs(r_multiple) which
+                        # fails when pnl=0 and is sensitive to rounding.
+                        # Schema 2 = "risk_dollars is effective qty*stop_dist
+                        # AFTER any notional clamp", matching what governor.py
+                        # currently returns from size_position.
+                        "risk_dollars": update.closed_trade.risk_dollars,
+                        "risk_schema_version": 2,
                         "mfe_pnl": update.closed_trade.mfe_pnl,
                         "mae_pnl": update.closed_trade.mae_pnl,
                         "ml_prob": ml_prob,
@@ -711,6 +954,38 @@ class SweepBot:
                 "signal_score": signal.signal_score,
                 "coin": w.coin,
             }
+            pause_reason = self._runtime_pause_reason()
+            if pause_reason is not None:
+                self._count_block("runtime_pause")
+                self.journal.write(
+                    "decision",
+                    signal_id,
+                    {
+                        "ts_ms": bar.end_ms,
+                        "allowed": False,
+                        "reason": pause_reason,
+                        "coin": w.coin,
+                    },
+                )
+                log.info("Signal blocked: %s", pause_reason)
+                continue
+            block = self._operator_blocklist_check(w.coin, signal, regime.session)
+            if block is not None:
+                bucket, reason = block
+                self._count_block(bucket)
+                self.journal.write(
+                    "decision",
+                    signal_id,
+                    {
+                        "ts_ms": bar.end_ms,
+                        "allowed": False,
+                        "reason": reason,
+                        "coin": w.coin,
+                    },
+                )
+                log.info("Signal blocked: %s", reason)
+                continue
+
             if w.executor.has_exposure():
                 self.journal.write(
                     "decision",
@@ -1137,6 +1412,56 @@ class SweepBot:
         self._signal_seq += 1
         return f"{ts_ms}-{self._signal_seq}"
 
+    @staticmethod
+    def _make_run_id(config: AppConfig, ts_ms: int) -> str:
+        configured = config.runtime.run_id.strip()
+        if configured:
+            return configured
+        dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        return f"{dt.strftime('%Y%m%dT%H%M%SZ')}-{config.mode}"
+
+    def _write_run_start(self, ts_ms: int) -> None:
+        self.journal.write(
+            "run",
+            self.run_id,
+            {
+                "ts_ms": ts_ms,
+                "event": "run_start",
+                "schema": 2,
+                "coins": self.cfg.feed.coins,
+                "timeframe_sec": self.cfg.strategy.timeframe_sec,
+                "warmup_enabled": self.cfg.strategy.warmup_enabled,
+                "ml_enabled": self.cfg.runtime.ml_enabled,
+                "ml_provider": self.cfg.runtime.ml_provider,
+                "ml_fail_open": self.cfg.runtime.ml_fail_open,
+                "risk_per_trade_pct": self.cfg.risk.risk_per_trade_pct,
+                "account_equity": self.cfg.risk.account_equity,
+                "min_conf_range": self.cfg.strategy.min_confidence_range,
+                "min_conf_trend": self.cfg.strategy.min_confidence_trend,
+                "min_signal_score": self.cfg.strategy.min_signal_score,
+                "maker_fee_pct": self.cfg.strategy.maker_fee_pct,
+                "taker_fee_pct": self.cfg.strategy.taker_fee_pct,
+                "paper_entry_slippage_bps": self.cfg.strategy.paper_entry_slippage_bps,
+                "paper_exit_slippage_bps": self.cfg.strategy.paper_exit_slippage_bps,
+                "paper_tp1_is_taker": self.cfg.strategy.paper_tp1_is_taker,
+                "allowed_coins": sorted(self.cfg.strategy.allowed_coins),
+                "allowed_level_labels": sorted(self.cfg.strategy.allowed_level_labels),
+                "allowed_coin_level_pairs": sorted(self.cfg.strategy.allowed_coin_level_pairs),
+                "allowed_coin_session_pairs": sorted(self.cfg.strategy.allowed_coin_session_pairs),
+                "allowed_coin_session_level_triples": sorted(self.cfg.strategy.allowed_coin_session_level_triples),
+                "allowed_sessions": sorted(self.cfg.strategy.allowed_sessions),
+                "allowed_sides": sorted(self.cfg.strategy.allowed_sides),
+                "blocked_coins": sorted(self.cfg.strategy.blocked_coins),
+                "blocked_level_labels": sorted(self.cfg.strategy.blocked_level_labels),
+                "blocked_coin_level_pairs": sorted(self.cfg.strategy.blocked_coin_level_pairs),
+                "blocked_coin_session_pairs": sorted(self.cfg.strategy.blocked_coin_session_pairs),
+                "blocked_coin_session_level_triples": sorted(self.cfg.strategy.blocked_coin_session_level_triples),
+                "blocked_sessions": sorted(self.cfg.strategy.blocked_sessions),
+                "blocked_sides": sorted(self.cfg.strategy.blocked_sides),
+                "restored_trades": self._resolved_trades,
+            },
+        )
+
     def _regime_state(self, ts_ms: int) -> RegimeState:
         closes = list(self._recent_closes)[-self.cfg.strategy.trend_lookback_bars :]
         ranges = list(self._recent_bar_ranges)[-self.cfg.strategy.trend_lookback_bars :]
@@ -1158,6 +1483,76 @@ class SweepBot:
         if regime.regime == Regime.ILLIQUID and self.cfg.strategy.disable_in_illiquid:
             return True
         return False
+
+    def _operator_blocklist_check(
+        self,
+        coin: str,
+        signal: SweepSignal,
+        session: str,
+    ) -> tuple[str, str] | None:
+        coin_key = coin.strip().upper()
+        allowed_coins = self.cfg.strategy.allowed_coins
+        if allowed_coins and not _matches_block_pattern(coin_key, allowed_coins):
+            return "allow_coin_miss", f"allow_coin_miss:{coin_key}"
+
+        blocked_coins = self.cfg.strategy.blocked_coins
+        if _matches_block_pattern(coin_key, blocked_coins):
+            return "block_coin", f"block_coin:{coin_key}"
+
+        level_key = signal.level_label.strip().lower()
+        allowed_levels = self.cfg.strategy.allowed_level_labels
+        if allowed_levels and not _matches_block_pattern(level_key, allowed_levels):
+            return "allow_level_miss", f"allow_level_miss:{level_key}"
+
+        blocked_levels = self.cfg.strategy.blocked_level_labels
+        if _matches_block_pattern(level_key, blocked_levels):
+            return "block_level", f"block_level:{level_key}"
+
+        allowed_coin_levels = self.cfg.strategy.allowed_coin_level_pairs
+        if allowed_coin_levels and not _matches_coin_level_pair(coin_key, level_key, allowed_coin_levels):
+            return "allow_coin_level_miss", f"allow_coin_level_miss:{coin_key}:{level_key}"
+
+        blocked_coin_levels = self.cfg.strategy.blocked_coin_level_pairs
+        if _matches_coin_level_pair(coin_key, level_key, blocked_coin_levels):
+            return "block_coin_level", f"block_coin_level:{coin_key}:{level_key}"
+
+        session_key = session.strip().lower()
+        allowed_coin_sessions = self.cfg.strategy.allowed_coin_session_pairs
+        if allowed_coin_sessions and not _matches_coin_session_pair(coin_key, session_key, allowed_coin_sessions):
+            return "allow_coin_session_miss", f"allow_coin_session_miss:{coin_key}:{session_key}"
+
+        blocked_coin_sessions = self.cfg.strategy.blocked_coin_session_pairs
+        if _matches_coin_session_pair(coin_key, session_key, blocked_coin_sessions):
+            return "block_coin_session", f"block_coin_session:{coin_key}:{session_key}"
+
+        allowed_coin_session_levels = self.cfg.strategy.allowed_coin_session_level_triples
+        if allowed_coin_session_levels and not _matches_coin_session_level_triple(
+            coin_key, session_key, level_key, allowed_coin_session_levels
+        ):
+            return "allow_coin_session_level_miss", f"allow_coin_session_level_miss:{coin_key}:{session_key}:{level_key}"
+
+        blocked_coin_session_levels = self.cfg.strategy.blocked_coin_session_level_triples
+        if _matches_coin_session_level_triple(coin_key, session_key, level_key, blocked_coin_session_levels):
+            return "block_coin_session_level", f"block_coin_session_level:{coin_key}:{session_key}:{level_key}"
+
+        allowed_sessions = self.cfg.strategy.allowed_sessions
+        if allowed_sessions and not _matches_block_pattern(session_key, allowed_sessions):
+            return "allow_session_miss", f"allow_session_miss:{session_key}"
+
+        blocked_sessions = self.cfg.strategy.blocked_sessions
+        if _matches_block_pattern(session_key, blocked_sessions):
+            return "block_session", f"block_session:{session_key}"
+
+        side_key = signal.side.value.strip().lower()
+        allowed_sides = self.cfg.strategy.allowed_sides
+        if allowed_sides and not _matches_block_pattern(side_key, allowed_sides):
+            return "allow_side_miss", f"allow_side_miss:{side_key}"
+
+        blocked_sides = self.cfg.strategy.blocked_sides
+        if _matches_block_pattern(side_key, blocked_sides):
+            return "block_side", f"block_side:{side_key}"
+
+        return None
 
     def _ml_decision_mode(self) -> str:
         mode = str(self.cfg.runtime.ml_decision_mode or "rank").strip().lower()
@@ -1271,8 +1666,7 @@ class SweepBot:
         min_ofi = max(0.0, self.cfg.strategy.min_ofi_ratio)
         min_q = max(0.0, self.cfg.strategy.min_queue_imbalance)
         warmup_on = self._in_warmup_mode()
-        # Always use OR logic — any one microstructure signal confirming is sufficient
-        soft_or = True
+        soft_or = warmup_on and self.cfg.strategy.warmup_micro_or_logic
         if warmup_on and self.cfg.strategy.warmup_micro_relax:
             min_ofi *= max(0.0, self.cfg.strategy.warmup_ofi_scale)
             min_q *= max(0.0, self.cfg.strategy.warmup_qimb_scale)
@@ -1457,7 +1851,7 @@ class SweepBot:
         min_ofi = max(0.0, self.cfg.strategy.min_ofi_ratio)
         min_q = max(0.0, self.cfg.strategy.min_queue_imbalance)
         warmup_on = self._in_warmup_mode()
-        soft_or = True
+        soft_or = warmup_on and self.cfg.strategy.warmup_micro_or_logic
         if warmup_on and self.cfg.strategy.warmup_micro_relax:
             min_ofi *= max(0.0, self.cfg.strategy.warmup_ofi_scale)
             min_q *= max(0.0, self.cfg.strategy.warmup_qimb_scale)
@@ -1555,11 +1949,15 @@ class SweepBot:
         SDK push fires at the configured deadman_refresh_sec interval with a
         safety margin against timing jitter from the 60s heartbeat."""
         for w in self._workers.values():
+            has_exposure = getattr(w.executor, "has_exposure", None)
+            if callable(has_exposure) and not has_exposure():
+                continue
             if hasattr(w.executor, "should_refresh_deadman") and w.executor.should_refresh_deadman(now_ms):
                 w.executor.refresh_deadman(now_ms)
 
-    def runtime_summary(self) -> dict[str, float | int | dict[str, int]]:
+    def runtime_summary(self) -> dict[str, str | float | int | dict[str, int]]:
         return {
+            "run_id": self.run_id,
             "trade_events": self._trade_events,
             "book_events": self._book_events,
             "bars_closed": self._bars_closed,

@@ -48,6 +48,24 @@ def test_position_sizing_uses_risk_cap() -> None:
     assert round(size.notional, 6) == 2000.0
 
 
+def test_position_sizing_reports_actual_risk_after_notional_clamp() -> None:
+    gov = RiskGovernor(
+        risk_cfg=RiskConfig(
+            account_equity=50.0,
+            risk_per_trade_pct=0.5,
+            max_leverage=1.0,
+            min_qty=0.0001,
+        ),
+        strategy_cfg=StrategyConfig(),
+    )
+
+    size = gov.size_position(entry_price=100.0, stop_price=99.9)
+
+    assert round(size.notional, 6) == 50.0
+    assert round(size.qty, 6) == 0.5
+    assert round(size.risk_dollars, 6) == 0.05
+
+
 def test_daily_loss_limit_blocks_new_trades() -> None:
     risk_cfg = RiskConfig(
         account_equity=1000.0,
