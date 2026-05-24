@@ -32,6 +32,59 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _csv_values(value: str, *, upper: bool = False) -> set[str]:
+    out: set[str] = set()
+    for raw in value.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        out.add(item.upper() if upper else item.lower())
+    return out
+
+
+def _csv_coin_level_pairs(value: str) -> set[str]:
+    out: set[str] = set()
+    for raw in value.split(","):
+        item = raw.strip()
+        if not item or ":" not in item:
+            continue
+        coin, level = item.split(":", 1)
+        coin = coin.strip().upper()
+        level = level.strip().lower()
+        if coin and level:
+            out.add(f"{coin}:{level}")
+    return out
+
+
+def _csv_coin_session_pairs(value: str) -> set[str]:
+    out: set[str] = set()
+    for raw in value.split(","):
+        item = raw.strip()
+        if not item or ":" not in item:
+            continue
+        coin, session = item.split(":", 1)
+        coin = coin.strip().upper()
+        session = session.strip().lower()
+        if coin and session:
+            out.add(f"{coin}:{session}")
+    return out
+
+
+def _csv_coin_session_level_triples(value: str) -> set[str]:
+    out: set[str] = set()
+    for raw in value.split(","):
+        item = raw.strip()
+        if item.count(":") < 2:
+            continue
+        coin, session, level = item.split(":", 2)
+        coin = coin.strip().upper()
+        session = session.strip().lower()
+        level = level.strip().lower()
+        if coin and session and level:
+            out.add(f"{coin}:{session}:{level}")
+    return out
+
+
 @dataclass(slots=True)
 class FeedConfig:
     ws_url: str = "wss://api.hyperliquid.xyz/ws"
@@ -104,6 +157,20 @@ class StrategyConfig:
     min_tp1_bps: float = 25.0
     min_tp2_bps: float = 50.0
     long_only: bool = True
+    allowed_coins_str: str = ""
+    allowed_level_labels_str: str = ""
+    allowed_coin_level_pairs_str: str = ""
+    allowed_coin_session_pairs_str: str = ""
+    allowed_coin_session_level_triples_str: str = ""
+    allowed_sessions_str: str = ""
+    allowed_sides_str: str = ""
+    blocked_coins_str: str = ""
+    blocked_level_labels_str: str = ""
+    blocked_coin_level_pairs_str: str = ""
+    blocked_coin_session_pairs_str: str = ""
+    blocked_coin_session_level_triples_str: str = ""
+    blocked_sessions_str: str = ""
+    blocked_sides_str: str = ""
     # Selectivity gates: block low-quality signals before they become entries.
     # min_signal_score is a floor on the data-grounded signal_score (0.0-1.0)
     # — set to e.g. 0.55 to require above-median quality, lowering trade rate
@@ -151,6 +218,62 @@ class StrategyConfig:
     paper_exit_slippage_bps: float = 1.5
     paper_tp1_is_taker: bool = True
 
+    @property
+    def allowed_coins(self) -> set[str]:
+        return _csv_values(self.allowed_coins_str, upper=True)
+
+    @property
+    def allowed_level_labels(self) -> set[str]:
+        return _csv_values(self.allowed_level_labels_str)
+
+    @property
+    def allowed_coin_level_pairs(self) -> set[str]:
+        return _csv_coin_level_pairs(self.allowed_coin_level_pairs_str)
+
+    @property
+    def allowed_coin_session_pairs(self) -> set[str]:
+        return _csv_coin_session_pairs(self.allowed_coin_session_pairs_str)
+
+    @property
+    def allowed_coin_session_level_triples(self) -> set[str]:
+        return _csv_coin_session_level_triples(self.allowed_coin_session_level_triples_str)
+
+    @property
+    def allowed_sessions(self) -> set[str]:
+        return _csv_values(self.allowed_sessions_str)
+
+    @property
+    def allowed_sides(self) -> set[str]:
+        return _csv_values(self.allowed_sides_str)
+
+    @property
+    def blocked_coins(self) -> set[str]:
+        return _csv_values(self.blocked_coins_str, upper=True)
+
+    @property
+    def blocked_level_labels(self) -> set[str]:
+        return _csv_values(self.blocked_level_labels_str)
+
+    @property
+    def blocked_coin_level_pairs(self) -> set[str]:
+        return _csv_coin_level_pairs(self.blocked_coin_level_pairs_str)
+
+    @property
+    def blocked_coin_session_pairs(self) -> set[str]:
+        return _csv_coin_session_pairs(self.blocked_coin_session_pairs_str)
+
+    @property
+    def blocked_coin_session_level_triples(self) -> set[str]:
+        return _csv_coin_session_level_triples(self.blocked_coin_session_level_triples_str)
+
+    @property
+    def blocked_sessions(self) -> set[str]:
+        return _csv_values(self.blocked_sessions_str)
+
+    @property
+    def blocked_sides(self) -> set[str]:
+        return _csv_values(self.blocked_sides_str)
+
 
 @dataclass(slots=True)
 class LevelConfig:
@@ -196,13 +319,64 @@ class RiskConfig:
     level_edge_pause_avg_r: float = -0.25
     level_edge_pause_min_trades: int = 2
 
+    def __post_init__(self) -> None:
+        # Catch fat-finger typos before they wipe the account. The bot multiplies
+        # equity * (risk_per_trade_pct / 100) per trade, so a missing decimal
+        # (e.g. BOT_RISK_PER_TRADE_PCT=75 meaning "75%" gets read as "75%") would
+        # risk 75% of equity on a single signal. These bounds are conservative —
+        # if you genuinely want them looser, raise the constant deliberately.
+        if self.account_equity <= 0:
+            raise ValueError(
+                f"RiskConfig.account_equity must be > 0 (got {self.account_equity}); "
+                f"check BOT_ACCOUNT_EQUITY"
+            )
+        if not (0 < self.risk_per_trade_pct <= 25.0):
+            raise ValueError(
+                f"RiskConfig.risk_per_trade_pct must be in (0, 25]% (got {self.risk_per_trade_pct}); "
+                f"check BOT_RISK_PER_TRADE_PCT — anything above 25% per trade is almost certainly a typo"
+            )
+        if not (0 < self.max_leverage <= 50.0):
+            raise ValueError(
+                f"RiskConfig.max_leverage must be in (0, 50] (got {self.max_leverage}); "
+                f"check BOT_MAX_LEVERAGE — HL caps at 50x"
+            )
+        if self.daily_loss_limit_r <= 0:
+            raise ValueError(
+                f"RiskConfig.daily_loss_limit_r must be > 0 (got {self.daily_loss_limit_r}); "
+                f"value is treated as magnitude (e.g. 2.5 = stop after -2.5R cumulative)"
+            )
+        if self.min_qty <= 0:
+            raise ValueError(f"RiskConfig.min_qty must be > 0 (got {self.min_qty})")
+        if self.portfolio_max_positions <= 0:
+            raise ValueError(
+                f"RiskConfig.portfolio_max_positions must be > 0 (got {self.portfolio_max_positions})"
+            )
+        if self.risk_mult_min < 0 or self.risk_mult_max < self.risk_mult_min:
+            raise ValueError(
+                f"RiskConfig.risk_mult_min ({self.risk_mult_min}) must be >= 0 and "
+                f"<= risk_mult_max ({self.risk_mult_max})"
+            )
+        for fld in (
+            "loss_cooldown_sec", "hard_loss_cooldown_sec", "side_hard_loss_cooldown_sec",
+            "level_hard_loss_cooldown_sec", "side_edge_pause_cooldown_sec",
+        ):
+            val = getattr(self, fld)
+            if val < 0:
+                raise ValueError(f"RiskConfig.{fld} must be >= 0 (got {val})")
+
 
 @dataclass(slots=True)
 class RuntimeConfig:
     runtime_dir: str = "runtime"
     journal_path: str = "runtime/signals.jsonl"
+    trade_pause_path: str = "runtime/trade_pause.flag"
+    run_id: str = ""
+    history_warm_start_enabled: bool = False
+    history_warm_start_bars: int = 90
     market_capture_enabled: bool = False
     market_capture_path: str = "runtime/market_events.jsonl"
+    market_capture_max_bytes: int = 0
+    market_capture_backups: int = 3
     ml_state_path: str = "runtime/ml_state.json"
     ml_enabled: bool = False
     ml_decision_mode: str = "rank"
@@ -355,6 +529,20 @@ def load_config() -> AppConfig:
         min_tp1_bps=_env_float("BOT_MIN_TP1_BPS", 25.0),
         min_tp2_bps=_env_float("BOT_MIN_TP2_BPS", 50.0),
         long_only=_env_bool("BOT_LONG_ONLY", True),
+        allowed_coins_str=_env_str("BOT_ALLOW_COINS", ""),
+        allowed_level_labels_str=_env_str("BOT_ALLOW_LEVEL_LABELS", ""),
+        allowed_coin_level_pairs_str=_env_str("BOT_ALLOW_COIN_LEVELS", ""),
+        allowed_coin_session_pairs_str=_env_str("BOT_ALLOW_COIN_SESSIONS", ""),
+        allowed_coin_session_level_triples_str=_env_str("BOT_ALLOW_COIN_SESSION_LEVELS", ""),
+        allowed_sessions_str=_env_str("BOT_ALLOW_SESSIONS", ""),
+        allowed_sides_str=_env_str("BOT_ALLOW_SIDES", ""),
+        blocked_coins_str=_env_str("BOT_BLOCK_COINS", ""),
+        blocked_level_labels_str=_env_str("BOT_BLOCK_LEVEL_LABELS", ""),
+        blocked_coin_level_pairs_str=_env_str("BOT_BLOCK_COIN_LEVELS", ""),
+        blocked_coin_session_pairs_str=_env_str("BOT_BLOCK_COIN_SESSIONS", ""),
+        blocked_coin_session_level_triples_str=_env_str("BOT_BLOCK_COIN_SESSION_LEVELS", ""),
+        blocked_sessions_str=_env_str("BOT_BLOCK_SESSIONS", ""),
+        blocked_sides_str=_env_str("BOT_BLOCK_SIDES", ""),
         min_signal_score=_env_float("BOT_MIN_SIGNAL_SCORE", 0.0),
         regime_filter_enabled=_env_bool("BOT_REGIME_FILTER_ENABLED", False),
         regime_filter_ma_bars=_env_int("BOT_REGIME_FILTER_MA_BARS", 30),
@@ -369,7 +557,7 @@ def load_config() -> AppConfig:
         trail_from_entry_factor=_env_float("BOT_TRAIL_FROM_ENTRY_FACTOR", 0.25),
         runner_trail_sec=_env_int("BOT_RUNNER_TRAIL_SEC", 300),
         runner_trail_factor=_env_float("BOT_RUNNER_TRAIL_FACTOR", 0.45),
-        maker_fee_pct=_env_float("BOT_MAKER_FEE_PCT", -0.00015),
+        maker_fee_pct=_env_float("BOT_MAKER_FEE_PCT", 0.00015),
         taker_fee_pct=_env_float("BOT_TAKER_FEE_PCT", 0.00045),
         paper_entry_slippage_bps=_env_float("BOT_PAPER_ENTRY_SLIPPAGE_BPS", 0.0),
         paper_exit_slippage_bps=_env_float("BOT_PAPER_EXIT_SLIPPAGE_BPS", 1.5),
@@ -410,8 +598,14 @@ def load_config() -> AppConfig:
     runtime = RuntimeConfig(
         runtime_dir=_env_str("BOT_RUNTIME_DIR", "runtime"),
         journal_path=_env_str("BOT_JOURNAL_PATH", "runtime/signals.jsonl"),
+        trade_pause_path=_env_str("BOT_TRADE_PAUSE_PATH", "runtime/trade_pause.flag"),
+        run_id=_env_str("BOT_RUN_ID", ""),
+        history_warm_start_enabled=_env_bool("BOT_HISTORY_WARM_START_ENABLED", False),
+        history_warm_start_bars=_env_int("BOT_HISTORY_WARM_START_BARS", 90),
         market_capture_enabled=_env_bool("BOT_MARKET_CAPTURE_ENABLED", False),
         market_capture_path=_env_str("BOT_MARKET_CAPTURE_PATH", "runtime/market_events.jsonl"),
+        market_capture_max_bytes=_env_int("BOT_MARKET_CAPTURE_MAX_BYTES", 0),
+        market_capture_backups=_env_int("BOT_MARKET_CAPTURE_BACKUPS", 3),
         ml_state_path=_env_str("BOT_ML_STATE_PATH", "runtime/ml_state.json"),
         ml_enabled=_env_bool("BOT_ML_ENABLED", False),
         ml_decision_mode=_env_str("BOT_ML_DECISION_MODE", "rank").lower(),

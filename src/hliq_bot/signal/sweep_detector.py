@@ -58,6 +58,13 @@ class SweepDetector:
         self._tp1_bps: float = config.tp1_bps
         self._tp2_bps: float = config.tp2_bps
 
+    def seed_history(self, bars: list[Bar]) -> int:
+        added = 0
+        for bar in bars:
+            self._history.append(bar)
+            added += 1
+        return added
+
     def on_bar(self, bar: Bar) -> SweepSignal | None:
         history = list(self._history)
         signal = None

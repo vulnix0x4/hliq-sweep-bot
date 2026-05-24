@@ -33,6 +33,14 @@ HL_MIN_ORDER_NOTIONAL = 10.0
 # rejecting state from any restart that genuinely lost track of the position.
 PERSISTED_STATE_MAX_AGE_SEC = 300
 
+# Slippage buffer on the stop trigger's limit_px. The stop is sent as
+# {triggerPx: X, isMarket: True} but HL still treats limit_px as the slippage
+# cap when the trigger fires. If limit_px == triggerPx, a gap-through cannot
+# fill (LONG: bids gap below the trigger). 2% gives generous fill room for
+# the kind of fast adverse moves a stop is meant to catch, while still
+# bounding the worst-case loss vs an unconditional market.
+NATIVE_STOP_SLIPPAGE_PCT = 0.02
+
 
 def _cloid_from_signal_id(signal_id: str):
     """Derive a deterministic Cloid from our internal signal_id.
@@ -46,6 +54,8 @@ def _cloid_from_signal_id(signal_id: str):
 
 
 class HyperliquidOrderManager:
+    NATIVE_STOPS_SUPPORTED = True
+
     """Live-execution adapter mirroring PaperOrderManager's public surface.
 
     Safety:
@@ -74,6 +84,7 @@ class HyperliquidOrderManager:
         self.position: OpenPosition | None = None
         self._last_trade_ms: int = 0
         self._pending_oid: int | None = None
+        self._native_stop_oid: int | None = None
         self._last_fill_poll_ms: int = 0
         self._agent_addr: str | None = None
         self._last_deadman_refresh_ms: int = 0
@@ -100,6 +111,10 @@ class HyperliquidOrderManager:
         self._state_path = self._state_dir / f"{self.coin}.json"
         # Track the last persisted state to avoid redundant writes on every tick.
         self._last_persisted_hash: str | None = None
+        # Stash for a ClosedTrade produced by an immediate-fill on native stop
+        # placement (see _handle_native_stop_immediate_fill). Picked up by the
+        # next on_trade tick and emitted as a POSITION_CLOSED ExecutionUpdate.
+        self._pending_immediate_close: ClosedTrade | None = None
 
     # ---- Public surface (mirrors PaperOrderManager) ----
 
@@ -286,6 +301,10 @@ class HyperliquidOrderManager:
     def on_trade(self, trade: TradeEvent) -> list[ExecutionUpdate]:
         self._last_trade_ms = trade.ts_ms
         updates: list[ExecutionUpdate] = []
+        # Surface any closed-trade that was produced asynchronously by a prior
+        # tick's native-stop immediate-fill (kept here so we don't have to
+        # plumb a return path through _place_native_stop's many call sites).
+        updates.extend(self._drain_pending_immediate_close(trade.ts_ms))
         # Detect fill FIRST: if HL filled our order, that supersedes expiry.
         updates.extend(self._maybe_detect_fill(trade.ts_ms))
         # Only expire if no fill happened (pending_entry still set).
@@ -295,6 +314,22 @@ class HyperliquidOrderManager:
         # No-op if the serialized state hasn't changed since last write.
         self._persist_position()
         return updates
+
+    def _drain_pending_immediate_close(self, ts_ms: int) -> list[ExecutionUpdate]:
+        if self._pending_immediate_close is None:
+            return []
+        closed = self._pending_immediate_close
+        self._pending_immediate_close = None
+        return [ExecutionUpdate(
+            ts_ms=ts_ms,
+            event_type=ExecEventType.POSITION_CLOSED,
+            message=(
+                f"hl native stop immediate-fill close [{self.live_cfg.network}]: "
+                f"pnl={closed.pnl:.4f} fees={closed.fees_paid:.4f}"
+            ),
+            signal_id=closed.signal_id,
+            closed_trade=closed,
+        )]
 
     def _maybe_detect_fill(self, now_ms: int) -> list[ExecutionUpdate]:
         """Poll info.user_state to see if our pending entry has been filled."""
@@ -359,6 +394,7 @@ class HyperliquidOrderManager:
                 best_price=entry_px,
                 worst_price=entry_px,
             )
+            self._place_native_stop()
             self.pending_entry = None
             self._pending_oid = None
             return [ExecutionUpdate(
@@ -419,7 +455,16 @@ class HyperliquidOrderManager:
 
         # Tier 1: try restoring from persisted state (the daily-restart common case).
         if self._try_restore_from_persisted(hl_pos):
-            self._cancel_stale_resting_orders(address)
+            preserved = self._cancel_stale_resting_orders(address, preserve_oids={self._native_stop_oid})
+            if preserved is not None and self._native_stop_oid is not None and self._native_stop_oid not in preserved:
+                log.warning(
+                    "Persisted native stop oid=%s for %s was not found on HL; placing replacement stop",
+                    self._native_stop_oid, self.coin,
+                )
+                self._native_stop_oid = None
+                if self.position is not None:
+                    self.position.native_stop_oid = None
+            self._ensure_native_stop()
             return
 
         # Tier 2: fallback wide-stop reconcile path.
@@ -468,32 +513,90 @@ class HyperliquidOrderManager:
             )
 
         self._cancel_stale_resting_orders(address)
+        self._ensure_native_stop()
 
-    def _cancel_stale_resting_orders(self, address: str) -> None:
+    @staticmethod
+    def _looks_like_trigger_sl(order: dict[str, Any]) -> bool:
+        """True if the open_orders row looks like a reduce-only stop-loss trigger.
+
+        HL surfaces these as orderType strings like 'Stop Market' / 'Stop Limit'
+        with reduceOnly=true. We treat any reduce-only order with a stop-style
+        orderType as one of our native stops — the only orders that match this
+        shape on a coin we're managing are ones a prior bot instance placed.
+        """
+        reduce_only = bool(order.get("reduceOnly", False))
+        order_type = str(order.get("orderType", "")).lower()
+        is_trigger = "stop" in order_type or "trigger" in order_type
+        return reduce_only and is_trigger
+
+    def _cancel_stale_resting_orders(self, address: str, preserve_oids: set[int | None] | None = None) -> set[int] | None:
         """Cancel any resting orders for this coin at startup.
 
         Orders surviving a restart are most likely pre-restart pending entries
         that never filled — the local state for them is gone, so it's safer to
         cancel than to let them potentially fill into a position the bot has
         no management context for.
+
+        BUT: reduce-only trigger SL orders are ALWAYS preserved (regardless of
+        explicit preserve_oids). Cancelling a live native stop leaves the
+        position naked between cancel and replace; only-cancelling-entries is
+        always safer. If we find an unrecognized trigger SL and we have no
+        native_stop_oid set, adopt it as ours.
         """
+        keep = {int(oid) for oid in (preserve_oids or set()) if oid is not None}
+        preserved: set[int] = set()
         try:
             info = self._ensure_info()
             open_orders = info.open_orders(address)
-            coin_orders = [
-                {"coin": o.get("coin"), "oid": o.get("oid")}
-                for o in open_orders
-                if str(o.get("coin", "")).upper() == self.coin.upper() and o.get("oid")
-            ]
+            coin_orders = []
+            adopted_oid: int | None = None
+            for order in open_orders:
+                if str(order.get("coin", "")).upper() != self.coin.upper() or not order.get("oid"):
+                    continue
+                try:
+                    oid = int(order["oid"])
+                except (TypeError, ValueError):
+                    continue
+                if oid in keep:
+                    preserved.add(oid)
+                    continue
+                # Always preserve trigger SLs on our coin — they're a live stop,
+                # cancelling would create a naked window. Adopt if we don't
+                # already track one.
+                if self._looks_like_trigger_sl(order):
+                    preserved.add(oid)
+                    if self._native_stop_oid is None and adopted_oid is None:
+                        adopted_oid = oid
+                    continue
+                coin_orders.append({"coin": order.get("coin"), "oid": oid})
+            if adopted_oid is not None:
+                self._native_stop_oid = adopted_oid
+                if self.position is not None:
+                    self.position.native_stop_oid = adopted_oid
+                log.warning(
+                    "Reconcile adopted orphaned native stop oid=%s for %s "
+                    "(persisted state had no native_stop_oid)",
+                    adopted_oid, self.coin,
+                )
             if coin_orders:
                 exchange = self._ensure_exchange()
                 exchange.bulk_cancel(coin_orders)
                 log.warning(
-                    "Reconcile cancelled %d stale resting orders for %s",
-                    len(coin_orders), self.coin,
+                    "Reconcile cancelled %d stale resting orders for %s (preserved %d trigger SL)",
+                    len(coin_orders), self.coin, len(preserved),
                 )
         except Exception as exc:
             log.warning("HL open_orders / bulk_cancel failed during reconcile: %s", exc, exc_info=True)
+            # Treat as 'unknown HL state': clear our local native_stop_oid so
+            # the per-tick _ensure_native_stop forces a fresh placement. Better
+            # to place a duplicate stop (HL will reject one as reduce_only
+            # exceeds residual) than to believe in a stop that may have been
+            # auto-cancelled while we were offline.
+            self._native_stop_oid = None
+            if self.position is not None:
+                self.position.native_stop_oid = None
+            return None
+        return preserved
 
     def _agent_address(self) -> str:
         if self._agent_addr is None:
@@ -527,15 +630,12 @@ class HyperliquidOrderManager:
         if age_sec < self.pending_entry.expiry_sec:
             return []
         pe = self.pending_entry
-        # NOTE: If this cancel fails AND the order subsequently fills, the resulting
-        # position will be detected by Phase B.3's user_state polling. Operators
-        # should monitor bot.log for "HL cancel_by_cloid failed" and run
-        # scripts/flatten_live.py if they see one until B.3 lands.
         cancel_failed = False
         cancel_err: str | None = None
+        cancel_result: Any = None
         try:
             cloid = _cloid_from_signal_id(pe.signal_id)
-            self._ensure_exchange().cancel_by_cloid(self.coin, cloid)
+            cancel_result = self._ensure_exchange().cancel_by_cloid(self.coin, cloid)
         except Exception as exc:
             cancel_failed = True
             cancel_err = f"{type(exc).__name__}: {exc}"
@@ -544,6 +644,25 @@ class HyperliquidOrderManager:
                 pe.signal_id, self._pending_oid, exc,
                 exc_info=True,
             )
+        # Detect "already filled" — HL races between our expiry decision and the
+        # order filling are common at high volatility, and silently clearing
+        # pending_entry leaves the position orphaned (no stop, no TPs, no
+        # native_stop_oid). On any signal of a possible fill (either an
+        # explicit "already filled" error, OR a failed cancel for any reason),
+        # poll user_state RIGHT NOW (bypassing the 1s rate limit) so the fill
+        # can be promoted to a managed OpenPosition before we drop pending.
+        already_filled = self._cancel_indicates_already_filled(cancel_result)
+        if cancel_failed or already_filled:
+            self._last_fill_poll_ms = 0  # reset rate limit
+            fill_updates = self._maybe_detect_fill(now_ms)
+            if fill_updates:
+                # _maybe_detect_fill already cleared pending_entry and set self.position.
+                log.warning(
+                    "HL pending entry %s was filled before expiry cancel landed (already_filled=%s "
+                    "cancel_failed=%s) — promoted to OpenPosition via forced user_state poll.",
+                    pe.signal_id, already_filled, cancel_failed,
+                )
+                return fill_updates
         msg = (
             f"hl pending entry expired after {pe.expiry_sec}s: "
             f"{pe.side.value} @ {pe.entry_price:.2f} signal_id={pe.signal_id} oid={self._pending_oid}"
@@ -562,11 +681,43 @@ class HyperliquidOrderManager:
             )
         ]
 
+    @staticmethod
+    def _cancel_indicates_already_filled(result: Any) -> bool:
+        """Sniff a cancel_by_cloid response for the 'already filled' signal.
+
+        HL's cancel API returns either an exception, or a result dict whose
+        statuses may contain an error string. The exact wording can vary, so
+        we match on the substring 'filled' which appears in both observed
+        forms ('Order already filled' and 'Order was filled or canceled').
+        """
+        if not isinstance(result, dict):
+            return False
+        # Top-level err with reason string
+        top = result.get("response")
+        if isinstance(top, str) and "filled" in top.lower():
+            return True
+        if isinstance(top, dict):
+            statuses = top.get("data", {}).get("statuses", [])
+            for st in statuses:
+                if isinstance(st, dict):
+                    err = st.get("error")
+                    if isinstance(err, str) and "filled" in err.lower():
+                        return True
+                elif isinstance(st, str) and "filled" in st.lower():
+                    return True
+        return False
+
     def _maybe_manage_open_position(self, trade: TradeEvent) -> list[ExecutionUpdate]:
         if self.position is None:
             return []
         p = self.position
         self._update_excursions(trade.price)
+        # Per-tick safety net: if a prior _place_native_stop failed transiently
+        # (network blip, HL throttle) we may have an open position with no
+        # exchange-side stop. Retry every tick so we get back to a protected
+        # state as soon as HL is reachable again. _ensure_native_stop is a
+        # no-op when the oid is already set, so the cost is cheap.
+        self._ensure_native_stop()
 
         if p.side == Side.LONG:
             stop_hit = trade.price <= p.stop_price
@@ -635,6 +786,7 @@ class HyperliquidOrderManager:
         if self.position is None:
             return
         p = self.position
+        old_stop = p.stop_price
 
         # After TP1: aggressive trail
         if p.tp1_filled and self.cfg.trail_after_tp1:
@@ -648,6 +800,8 @@ class HyperliquidOrderManager:
                     new_stop = p.entry_price - (p.entry_price - p.best_price) * trail
                     if new_stop < p.stop_price:
                         p.stop_price = new_stop
+            if p.stop_price != old_stop:
+                self._replace_native_stop()
             return
 
         # Pre-TP1: trail from entry to lock in any favorable movement
@@ -672,6 +826,185 @@ class HyperliquidOrderManager:
                     new_stop = p.entry_price - (p.entry_price - p.best_price) * trail
                     if new_stop < p.stop_price:
                         p.stop_price = new_stop
+        if p.stop_price != old_stop:
+            self._replace_native_stop()
+
+    def _native_stop_order_type(self, stop_price: float) -> dict[str, dict[str, float | bool | str]]:
+        return {"trigger": {"triggerPx": self._round_px(stop_price), "isMarket": True, "tpsl": "sl"}}
+
+    def _extract_resting_oid(self, result: Any) -> int | None:
+        """Return the oid IFF the response indicates a resting order.
+
+        DOES NOT return oids from 'filled' statuses — a fill is a closed order,
+        not a live one, and storing it as 'the native stop' would make the bot
+        believe it has protection it doesn't have. Callers that need to handle
+        the immediate-fill case must check 'filled' separately via
+        _handle_native_stop_immediate_fill.
+        """
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            return None
+        statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+        if not statuses:
+            return None
+        status = statuses[0]
+        if not isinstance(status, dict):
+            return None
+        if "resting" not in status:
+            return None
+        try:
+            return int(status["resting"].get("oid"))
+        except (TypeError, ValueError):
+            return None
+
+    def _handle_native_stop_immediate_fill(self, result: Any, fallback_px: float) -> bool:
+        """If a native-stop placement filled immediately (price crossed the
+        trigger before HL accepted the order), realize the close NOW so the
+        bot doesn't carry a ghost position with the fill-oid mis-recorded as
+        the live stop.
+
+        Returns True if an immediate fill was handled (position cleared).
+        """
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            return False
+        statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+        if not statuses:
+            return False
+        status = statuses[0]
+        if not isinstance(status, dict) or "filled" not in status:
+            return False
+        p = self.position
+        if p is None:
+            return False
+        filled = status["filled"]
+        try:
+            actual_qty = float(filled.get("totalSz", 0) or 0)
+            fill_px = float(filled.get("avgPx", fallback_px) or fallback_px)
+        except (TypeError, ValueError):
+            return False
+        if actual_qty <= 0:
+            return False
+        log.warning(
+            "HL native stop placement for %s filled IMMEDIATELY (price crossed trigger "
+            "before placement landed): qty=%.6f @ %.4f — realizing close now.",
+            self.coin, actual_qty, fill_px,
+        )
+        pnl_gross = (
+            (fill_px - p.entry_price) * actual_qty
+            if p.side == Side.LONG
+            else (p.entry_price - fill_px) * actual_qty
+        )
+        pnl_gross += p.realized_pnl
+        final_fee = (fill_px * actual_qty) * self.cfg.taker_fee_pct
+        fees_paid = p.realized_fees + final_fee
+        pnl_net = pnl_gross - fees_paid
+        risk = max(p.risk_dollars, 1e-9)
+        closed = ClosedTrade(
+            signal_id=p.signal_id,
+            side=p.side,
+            entry_price=p.entry_price,
+            exit_price=fill_px,
+            qty=p.qty_initial,
+            pnl=pnl_net,
+            pnl_gross=pnl_gross,
+            fees_paid=fees_paid,
+            risk_dollars=risk,
+            r_multiple=pnl_net / risk,
+            opened_ms=p.opened_ms,
+            closed_ms=int(time.time() * 1000),
+            exit_reason="native_stop_immediate_fill",
+            coin=self.coin,
+            mfe_pnl=self._price_to_pnl(p.best_price),
+            mae_pnl=self._price_to_pnl(p.worst_price),
+        )
+        self._native_stop_oid = None
+        self.position = None
+        # Stash the closed trade on the manager so the caller can surface it;
+        # _maybe_detect_fill / _maybe_manage_open_position will pick it up
+        # through the standard ExecutionUpdate path on the next tick.
+        self._pending_immediate_close = closed
+        return True
+
+    def _place_native_stop(self) -> None:
+        p = self.position
+        if p is None or p.qty_remaining <= 0:
+            return
+        exchange = self._ensure_exchange()
+        is_buy = p.side == Side.SHORT
+        stop_px = self._round_px(p.stop_price)
+        # Slippage cap: limit_px must be on the adverse side of trigger so a
+        # gap-through can fill. LONG stop sells (is_buy=False) → accept any
+        # bid >= limit_px, so limit_px must be BELOW trigger. SHORT stop buys
+        # (is_buy=True) → accept any ask <= limit_px, so limit_px must be ABOVE.
+        if is_buy:  # SHORT stop
+            limit_px = self._round_px(stop_px * (1.0 + NATIVE_STOP_SLIPPAGE_PCT))
+        else:       # LONG stop
+            limit_px = self._round_px(stop_px * (1.0 - NATIVE_STOP_SLIPPAGE_PCT))
+        try:
+            result = exchange.order(
+                name=self.coin,
+                is_buy=is_buy,
+                sz=p.qty_remaining,
+                limit_px=limit_px,
+                order_type=self._native_stop_order_type(p.stop_price),
+                reduce_only=True,
+            )
+        except Exception as exc:
+            log.critical(
+                "HL native stop placement failed for %s %s qty=%s stop=%s: %s "
+                "— per-tick _ensure_native_stop will retry; position runs on "
+                "software-stop fallback until then.",
+                self.coin, p.side.value, p.qty_remaining, p.stop_price, exc, exc_info=True,
+            )
+            return
+        # If HL filled the trigger immediately (price already crossed), the
+        # response carries a 'filled' status — that's a closed position, NOT
+        # a resting stop. Adopt the close instead of treating the fill oid as
+        # an alive stop (which would make the bot think it has protection
+        # while the position is actually gone).
+        if self._handle_native_stop_immediate_fill(result, stop_px):
+            return
+        oid = self._extract_resting_oid(result)
+        if oid is None:
+            log.critical(
+                "HL native stop placement returned no resting oid for %s: %s "
+                "— per-tick _ensure_native_stop will retry next tick.",
+                self.coin, result,
+            )
+            return
+        self._native_stop_oid = oid
+        p.native_stop_oid = oid
+        log.info(
+            "HL native stop placed [%s]: %s reduce_only qty=%.6f trigger=%.4f limit=%.4f oid=%s",
+            self.live_cfg.network, self.coin, p.qty_remaining, stop_px, limit_px, oid,
+        )
+
+    def _cancel_native_stop(self) -> bool:
+        oid = self._native_stop_oid or (self.position.native_stop_oid if self.position is not None else None)
+        if oid is None:
+            return True
+        try:
+            self._ensure_exchange().cancel(self.coin, oid)
+        except Exception as exc:
+            log.warning("HL native stop cancel failed for %s oid=%s: %s", self.coin, oid, exc, exc_info=True)
+            return False
+        self._native_stop_oid = None
+        if self.position is not None:
+            self.position.native_stop_oid = None
+        return True
+
+    def _replace_native_stop(self) -> None:
+        if self.position is None:
+            return
+        if not self._cancel_native_stop():
+            return
+        self._place_native_stop()
+
+    def _ensure_native_stop(self) -> None:
+        if self.position is None or self.position.qty_remaining <= 0:
+            return
+        if self._native_stop_oid is not None or self.position.native_stop_oid is not None:
+            return
+        self._place_native_stop()
 
     def _extract_fill(self, result, default_px: float) -> tuple[float, float] | None:
         """Parse an exchange.order/market_close response and return (filled_qty, avg_px)
@@ -732,6 +1065,7 @@ class HyperliquidOrderManager:
             "realized_fees": p.realized_fees,
             "risk_dollars": p.risk_dollars,
             "opened_ms": p.opened_ms,
+            "native_stop_oid": p.native_stop_oid,
         }
         # Skip the file write if nothing meaningful changed (excluding ts_ms).
         sig = json.dumps({k: v for k, v in data.items() if k != "ts_ms"}, sort_keys=True)
@@ -823,7 +1157,9 @@ class HyperliquidOrderManager:
                 realized_fees=float(data.get("realized_fees", 0)),
                 best_price=float(data.get("best_price", data["entry_price"])),
                 worst_price=float(data.get("worst_price", data["entry_price"])),
+                native_stop_oid=int(data["native_stop_oid"]) if data.get("native_stop_oid") is not None else None,
             )
+            self._native_stop_oid = self.position.native_stop_oid
         except Exception as exc:
             log.warning("Failed to construct OpenPosition from persisted state: %s — falling through", exc)
             return False
@@ -894,6 +1230,7 @@ class HyperliquidOrderManager:
         if actual_qty >= partial_qty * 0.99:
             p.tp1_filled = True
             p.stop_price = p.entry_price  # reduce tail risk after first scale
+        self._replace_native_stop()
         return [ExecutionUpdate(
             ts_ms=ts_ms,
             event_type=ExecEventType.PARTIAL_TP,
@@ -907,6 +1244,7 @@ class HyperliquidOrderManager:
             return []
         exchange = self._ensure_exchange()
         requested_qty = p.qty_remaining
+        self._cancel_native_stop()
         try:
             result = exchange.market_close(
                 coin=self.coin,
@@ -918,6 +1256,7 @@ class HyperliquidOrderManager:
                 "HL market_close failed for %s qty=%s: %s",
                 self.coin, requested_qty, exc, exc_info=True,
             )
+            self._ensure_native_stop()
             # Cannot proceed: leaving position in place. Operator must manually intervene.
             return []
 
@@ -932,6 +1271,7 @@ class HyperliquidOrderManager:
                 self.coin,
             )
             sid = p.signal_id
+            self._cancel_native_stop()
             self.position = None
             return [ExecutionUpdate(
                 ts_ms=ts_ms,
@@ -953,6 +1293,7 @@ class HyperliquidOrderManager:
                 "Response: %s",
                 self.coin, requested_qty, result,
             )
+            self._ensure_native_stop()
             return []
         actual_qty, fill_px = extracted
 
@@ -972,6 +1313,7 @@ class HyperliquidOrderManager:
             p.realized_pnl += partial_pnl
             p.realized_fees += partial_fee
             p.qty_remaining -= actual_qty
+            self._replace_native_stop()
             return [ExecutionUpdate(
                 ts_ms=ts_ms,
                 event_type=ExecEventType.PARTIAL_TP,
@@ -1014,6 +1356,7 @@ class HyperliquidOrderManager:
             mfe_pnl=self._price_to_pnl(p.best_price),
             mae_pnl=self._price_to_pnl(p.worst_price),
         )
+        self._cancel_native_stop()
         self.position = None
         return [ExecutionUpdate(
             ts_ms=ts_ms,

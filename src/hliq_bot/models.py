@@ -143,6 +143,7 @@ class OpenPosition:
     best_price: float = 0.0
     worst_price: float = 0.0
     signal_id: str = ""
+    native_stop_oid: int | None = None
 
 
 @dataclass(slots=True)

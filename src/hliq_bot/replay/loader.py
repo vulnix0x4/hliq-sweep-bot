@@ -7,7 +7,7 @@ from typing import Iterator
 from hliq_bot.models import BookTopEvent, MarketEvent, TradeEvent
 
 
-def load_market_events(path: str) -> Iterator[MarketEvent]:
+def load_market_events(path: str, *, require_coin: bool = False) -> Iterator[MarketEvent]:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(path)
@@ -29,6 +29,8 @@ def load_market_events(path: str) -> Iterator[MarketEvent]:
             if ts_ms <= 0:
                 continue
             coin = str(row.get("coin", "")).strip().upper()
+            if require_coin and not coin:
+                continue
 
             if kind == "trade":
                 price = _safe_float(row.get("price"))

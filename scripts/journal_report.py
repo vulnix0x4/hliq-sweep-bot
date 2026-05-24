@@ -81,6 +81,38 @@ def _read_rows(path: str) -> list[dict[str, Any]]:
     return out
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _last_run_id(rows: list[dict[str, Any]]) -> str:
+    for row in reversed(rows):
+        if row.get("event_type") == "run" and row.get("event") == "run_start":
+            run_id = str(row.get("run_id", "")).strip()
+            if run_id:
+                return run_id
+    return ""
+
+
+def _filter_rows(
+    rows: list[dict[str, Any]],
+    *,
+    run_id: str = "",
+    since_ts_ms: int = 0,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if run_id and str(row.get("run_id", "")).strip() != run_id:
+            continue
+        if since_ts_ms > 0 and _safe_int(row.get("ts_ms")) < since_ts_ms:
+            continue
+        out.append(row)
+    return out
+
+
 def _fmt_rate(num: int, den: int) -> str:
     if den <= 0:
         return "n/a"
@@ -103,11 +135,21 @@ def _print_top_aggs(title: str, aggs: dict[str, Agg], n: int = 8) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze signal journal funnel and performance.")
     parser.add_argument("--input", default="runtime/signals.jsonl")
+    parser.add_argument("--run-id", default="", help="Only include rows for this run_id.")
+    parser.add_argument("--last-run", action="store_true", help="Only include rows for the latest journaled run_start.")
+    parser.add_argument("--since-ts-ms", type=int, default=0, help="Only include rows at/after this timestamp.")
     args = parser.parse_args()
 
     rows = _read_rows(args.input)
     if not rows:
         print(f"No journal rows found at {args.input}")
+        return 0
+    selected_run_id = args.run_id.strip()
+    if args.last_run:
+        selected_run_id = _last_run_id(rows) or selected_run_id
+    rows = _filter_rows(rows, run_id=selected_run_id, since_ts_ms=max(0, args.since_ts_ms))
+    if not rows:
+        print(f"No journal rows matched filters at {args.input}")
         return 0
 
     by_id: dict[str, dict[str, Any]] = defaultdict(dict)
@@ -149,6 +191,9 @@ def main() -> int:
     closed_signal_scores: list[float] = []
     mfe_vals: list[float] = []
     mae_vals: list[float] = []
+    bar_range_vals: list[float] = []
+    move_30s_vals: list[float] = []
+    abs_r_vals: list[float] = []
     allow_by_regime: Counter = Counter()
     cand_by_regime: Counter = Counter()
 
@@ -165,6 +210,16 @@ def main() -> int:
                 signal_scores.append(float(cand.get("signal_score", 0.0)))
             except (TypeError, ValueError):
                 pass
+            features = cand.get("features") or {}
+            if isinstance(features, dict):
+                try:
+                    bar_range_vals.append(abs(float(features.get("bar_range_pct", 0.0))))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    move_30s_vals.append(abs(float(features.get("move_30s_pct", 0.0))))
+                except (TypeError, ValueError):
+                    pass
         if dec is not None:
             decisions += 1
             if bool(dec.get("allowed", False)):
@@ -189,6 +244,7 @@ def main() -> int:
             r_val = float(out.get("r_multiple", 0.0))
             net_pnl += pnl
             r_sum += r_val
+            abs_r_vals.append(abs(r_val))
             if pnl > 0:
                 wins += 1
 
@@ -233,6 +289,10 @@ def main() -> int:
 
     print("Journal Report")
     print("========================================")
+    if selected_run_id:
+        print(f"run_id: {selected_run_id}")
+    if args.since_ts_ms > 0:
+        print(f"since_ts_ms: {args.since_ts_ms}")
     print(f"journal_rows: {len(rows)}")
     print(f"signals_candidate: {candidates}")
     print(f"signals_decided: {decisions}")
@@ -261,6 +321,27 @@ def main() -> int:
         print(f"avg_mfe_pnl: {sum(mfe_vals) / len(mfe_vals):.2f}")
     if mae_vals:
         print(f"avg_mae_pnl: {sum(mae_vals) / len(mae_vals):.2f}")
+
+    sanity_warnings: list[str] = []
+    max_abs_r = max(abs_r_vals) if abs_r_vals else 0.0
+    max_bar_range = max(bar_range_vals) if bar_range_vals else 0.0
+    max_move_30s = max(move_30s_vals) if move_30s_vals else 0.0
+    if max_abs_r > 25.0:
+        sanity_warnings.append(f"max_abs_r={max_abs_r:.3f} exceeds 25; replay/outcome data may be distorted")
+    if max_bar_range > 10.0:
+        sanity_warnings.append(
+            f"max_bar_range_pct={max_bar_range:.3f} exceeds 10%; captured prices may have scale jumps"
+        )
+    if max_move_30s > 10.0:
+        sanity_warnings.append(
+            f"max_abs_move_30s_pct={max_move_30s:.3f} exceeds 10%; captured prices may have scale jumps"
+        )
+    if sanity_warnings:
+        print()
+        print("Data sanity warnings")
+        print("--------------------")
+        for warning in sanity_warnings:
+            print(f"- {warning}")
 
     if denied_reasons:
         print()

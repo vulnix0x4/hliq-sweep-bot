@@ -4,12 +4,13 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import threading
-from typing import Any
+from typing import Any, Mapping
 
 
 @dataclass(slots=True)
 class SignalJournal:
     path: str
+    default_context: Mapping[str, Any] | None = None
     _path: Path = field(init=False, repr=False)
     _lock: threading.Lock = field(init=False, repr=False)
 
@@ -23,6 +24,7 @@ class SignalJournal:
         row = {
             "event_type": event_type,
             "signal_id": signal_id,
+            **dict(self.default_context or {}),
             **payload,
         }
         line = json.dumps(row, separators=(",", ":"), sort_keys=False)
