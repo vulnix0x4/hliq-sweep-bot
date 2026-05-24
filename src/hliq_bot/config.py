@@ -483,6 +483,27 @@ class AIConfig:
     context_bars: int = 30
     # Cost tracking budget (USD/day soft cap; logs warning when crossed).
     daily_budget_usd: float = 5.0
+    # Resilience — fallback model chain (comma-separated env). Primary fails →
+    # try these in order. Use a strong + cheap mix, e.g. "google/gemini-3.5-flash,
+    # anthropic/claude-haiku-4.5". Leave empty for no fallbacks.
+    fallback_models_str: str = ""
+    retry_attempts: int = 3
+    retry_base_sec: float = 1.0
+    # Circuit breaker — open after N consecutive failures, cool down N sec.
+    circuit_breaker_threshold: int = 6
+    circuit_breaker_cool_down_sec: int = 300
+    # Memory — persistent on-disk journal of the AI's own decisions+outcomes.
+    # When non-empty, AIStrategy loads this on boot and injects recent entries
+    # into each prompt (continuity across restarts).
+    memory_path: str = "runtime/ai_memory.jsonl"
+    memory_max_entries: int = 50
+    # Prompt version label — recorded on every decision row so reports can
+    # split performance by prompt iteration. Bump when you change the prompt.
+    prompt_version: str = "v1"
+
+    @property
+    def fallback_models(self) -> list[str]:
+        return [m.strip() for m in self.fallback_models_str.split(",") if m.strip()]
 
 
 @dataclass(slots=True)
@@ -706,6 +727,14 @@ def load_config() -> AppConfig:
         max_holding_sec=_env_int("BOT_AI_MAX_HOLDING_SEC", 7200),
         context_bars=_env_int("BOT_AI_CONTEXT_BARS", 30),
         daily_budget_usd=_env_float("BOT_AI_DAILY_BUDGET_USD", 5.0),
+        fallback_models_str=_env_str("BOT_AI_FALLBACK_MODELS", ""),
+        retry_attempts=_env_int("BOT_AI_RETRY_ATTEMPTS", 3),
+        retry_base_sec=_env_float("BOT_AI_RETRY_BASE_SEC", 1.0),
+        circuit_breaker_threshold=_env_int("BOT_AI_CIRCUIT_THRESHOLD", 6),
+        circuit_breaker_cool_down_sec=_env_int("BOT_AI_CIRCUIT_COOLDOWN_SEC", 300),
+        memory_path=_env_str("BOT_AI_MEMORY_PATH", "runtime/ai_memory.jsonl"),
+        memory_max_entries=_env_int("BOT_AI_MEMORY_MAX", 50),
+        prompt_version=_env_str("BOT_AI_PROMPT_VERSION", "v1"),
     )
 
     return AppConfig(

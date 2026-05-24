@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import statistics
 from typing import Any
 
+from hliq_bot.ai.market_data import CoinMeta, L2Book, MarketDataCache
 from hliq_bot.models import Bar, Side
 
 
@@ -38,10 +39,19 @@ class CoinContext:
     daily_pnl: float
     daily_r: float
     recent_outcomes: list[dict]   # last N closed AI trades for self-reflection
+    # Enriched fields (may be None when the market-data cache is offline):
+    funding_rate: float | None = None
+    open_interest: float | None = None
+    mark_price: float | None = None
+    day_change_pct: float | None = None
+    day_volume_usd: float | None = None
+    order_book: dict | None = None             # {bids, asks, spread_bps, depth_imbalance}
+    other_coins: list[dict] | None = None      # multi-coin sympathy view
+    portfolio: dict | None = None              # all-coin position summary
 
     def to_prompt_dict(self) -> dict[str, Any]:
         """JSON-serializable dict that goes verbatim into the user message."""
-        return {
+        d: dict[str, Any] = {
             "coin": self.coin,
             "now_utc": self.now_utc,
             "session": self.session,
@@ -63,6 +73,24 @@ class CoinContext:
             },
             "recent_outcomes": self.recent_outcomes,
         }
+        # Enriched fields only emitted when present, to keep tokens lean.
+        if self.funding_rate is not None:
+            d["funding_rate"] = round(self.funding_rate, 8)
+        if self.open_interest is not None:
+            d["open_interest"] = round(self.open_interest, 2)
+        if self.mark_price is not None:
+            d["mark_price"] = round(self.mark_price, 6)
+        if self.day_change_pct is not None:
+            d["day_change_pct"] = round(self.day_change_pct, 2)
+        if self.day_volume_usd is not None:
+            d["day_volume_usd"] = round(self.day_volume_usd, 0)
+        if self.order_book is not None:
+            d["order_book"] = self.order_book
+        if self.other_coins is not None:
+            d["other_coins"] = self.other_coins
+        if self.portfolio is not None:
+            d["portfolio"] = self.portfolio
+        return d
 
 
 def _session_from_hour(hour_utc: int) -> str:
@@ -137,6 +165,84 @@ def _range_bps(prices: list[tuple[int, float]], window_ms: int, now_ms: int) -> 
     return ((hi - lo) / last) * 10000
 
 
+def _l2_to_prompt_dict(book: L2Book) -> dict[str, Any]:
+    return {
+        "bids": [[round(p, 6), round(s, 4)] for p, s in book.bids],
+        "asks": [[round(p, 6), round(s, 4)] for p, s in book.asks],
+        "spread_bps": round(book.spread_bps() or 0.0, 2),
+        "depth_imbalance": round(book.depth_imbalance() or 1.0, 3),
+    }
+
+
+def _other_coins_summary(
+    market_data: MarketDataCache,
+    *,
+    focus_coin: str,
+    workers_by_coin: dict[str, Any] | None,
+    now_ms: int,
+) -> list[dict[str, Any]]:
+    """Compact per-other-coin view: change, funding, recent flow bias.
+
+    The LLM uses this to gauge alt-coin sympathy. Capped at 8 coins by
+    descending day_ntl_volume to keep tokens in check.
+    """
+    metas = market_data.all_meta()
+    if not metas:
+        return []
+    others = [m for c, m in metas.items() if c != focus_coin.upper()]
+    others.sort(key=lambda m: -(m.day_ntl_volume or 0))
+    out: list[dict[str, Any]] = []
+    for m in others[:8]:
+        row: dict[str, Any] = {
+            "coin": m.name,
+            "day_change_pct": round(m.day_change_pct, 2) if m.day_change_pct is not None else None,
+            "funding": round(m.funding, 8) if m.funding is not None else None,
+        }
+        # If this coin has a CoinWorker in our system, include its 5m flow bias.
+        w = (workers_by_coin or {}).get(m.name)
+        if w is not None:
+            bias, _ = _flow_bias(list(getattr(w, "recent_signed_flow", [])), 5 * 60 * 1000, now_ms)
+            row["flow_bias_5m"] = round(bias, 3)
+        out.append(row)
+    return out
+
+
+def _portfolio_summary(
+    workers_by_coin: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Snapshot of all open positions + pending entries across coins.
+
+    Used by the AI to avoid concentrating exposure or chasing correlated trades.
+    """
+    summary: dict[str, Any] = {
+        "open_positions": [],
+        "pending_entries": [],
+    }
+    if not workers_by_coin:
+        return summary
+    for coin, w in workers_by_coin.items():
+        position = getattr(w.executor, "position", None) if hasattr(w, "executor") else None
+        if position is not None:
+            summary["open_positions"].append({
+                "coin": coin,
+                "side": position.side.value,
+                "qty_remaining": round(position.qty_remaining, 8),
+                "entry_price": round(position.entry_price, 6),
+                "stop_price": round(position.stop_price, 6),
+            })
+        pending = getattr(w.executor, "pending_entry", None) if hasattr(w, "executor") else None
+        if pending is not None:
+            summary["pending_entries"].append({
+                "coin": coin,
+                "side": pending.side.value,
+                "qty": round(pending.qty, 8),
+                "entry_price": round(pending.entry_price, 6),
+            })
+    summary["concurrent_long"] = sum(1 for p in summary["open_positions"] if p["side"] == "long")
+    summary["concurrent_short"] = sum(1 for p in summary["open_positions"] if p["side"] == "short")
+    return summary
+
+
 def build_coin_context(
     worker: Any,                # bot.CoinWorker (duck-typed to avoid circular import)
     *,
@@ -147,6 +253,8 @@ def build_coin_context(
     daily_r: float,
     recent_outcomes: list[dict],
     context_bars: int = 30,
+    market_data: MarketDataCache | None = None,
+    workers_by_coin: dict[str, Any] | None = None,
 ) -> CoinContext:
     """Pull state from a CoinWorker into a CoinContext."""
     coin = worker.coin
@@ -196,6 +304,30 @@ def build_coin_context(
             "realized_pnl": round(getattr(position, "realized_pnl", 0.0), 4),
         }
 
+    # Enrichment from MarketDataCache (best-effort; AI works without it).
+    funding = oi = mark = day_change = day_vol = None
+    order_book_dict: dict | None = None
+    other_coins = None
+    if market_data is not None:
+        meta = market_data.meta_for(coin)
+        if meta is not None:
+            funding = meta.funding
+            oi = meta.open_interest
+            mark = meta.mark_px
+            day_change = meta.day_change_pct
+            day_vol = meta.day_ntl_volume
+        book = market_data.l2_for(coin)
+        if book is not None and (book.bids or book.asks):
+            order_book_dict = _l2_to_prompt_dict(book)
+        other_coins_list = _other_coins_summary(
+            market_data, focus_coin=coin,
+            workers_by_coin=workers_by_coin, now_ms=now_ms,
+        )
+        if other_coins_list:
+            other_coins = other_coins_list
+
+    portfolio = _portfolio_summary(workers_by_coin) if workers_by_coin else None
+
     return CoinContext(
         coin=coin,
         now_ms=now_ms,
@@ -216,4 +348,12 @@ def build_coin_context(
         daily_pnl=daily_pnl,
         daily_r=daily_r,
         recent_outcomes=recent_outcomes,
+        funding_rate=funding,
+        open_interest=oi,
+        mark_price=mark,
+        day_change_pct=day_change,
+        day_volume_usd=day_vol,
+        order_book=order_book_dict,
+        other_coins=other_coins,
+        portfolio=portfolio,
     )

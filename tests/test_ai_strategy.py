@@ -314,13 +314,253 @@ def test_decision_schema_is_valid_json_schema_shape():
     schema = decision_schema()
     assert schema["type"] == "object"
     assert "action" in schema["properties"]
-    assert set(schema["properties"]["action"]["enum"]) == {"open_long", "open_short", "close", "hold"}
+    assert set(schema["properties"]["action"]["enum"]) == {
+        "open_long", "open_short", "close", "hold",
+        "move_stop_to_breakeven", "modify_stop",
+        "scale_out", "add_to_position",
+    }
     # strict mode requires every property listed in required
     for prop in schema["properties"]:
         assert prop in schema["required"]
+
+
+def test_strategy_validates_modify_stop_requires_new_price(monkeypatch):
+    from hliq_bot.ai.client import AICallResult
+    from unittest.mock import MagicMock
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    s = AIStrategy(_ai_cfg(enabled=True))
+    s._llm = MagicMock()
+    s._llm.chat_json.return_value = AICallResult(
+        decision={
+            "action": "modify_stop", "confidence": 0.6, "reasoning": "r",
+            "stop_price": None, "tp1_price": None, "tp2_price": None,
+            "new_stop_price": None, "scale_fraction": None, "add_qty_fraction": None,
+        },
+        raw_text="{}", model="test", prompt_tokens=10, completion_tokens=5,
+        cost_usd=0.0, latency_ms=10, finish_reason="stop",
+    )
+    w = _FakeWorker()
+    result = s.decide_for_coin(
+        w, bars=[_bar(0, 100.0)], now_ms=1000,
+        account_equity=50, daily_pnl=0, daily_r=0, recent_outcomes=[],
+    )
+    assert result.action == "error"
+    assert result.error == "missing_new_stop_price"
+
+
+def test_strategy_validates_scale_out_fraction_range(monkeypatch):
+    from hliq_bot.ai.client import AICallResult
+    from unittest.mock import MagicMock
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    s = AIStrategy(_ai_cfg(enabled=True))
+    s._llm = MagicMock()
+    s._llm.chat_json.return_value = AICallResult(
+        decision={
+            "action": "scale_out", "confidence": 0.6, "reasoning": "r",
+            "stop_price": None, "tp1_price": None, "tp2_price": None,
+            "new_stop_price": None, "scale_fraction": 1.5,  # invalid
+            "add_qty_fraction": None,
+        },
+        raw_text="{}", model="test", prompt_tokens=10, completion_tokens=5,
+        cost_usd=0.0, latency_ms=10, finish_reason="stop",
+    )
+    result = s.decide_for_coin(
+        _FakeWorker(), bars=[_bar(0, 100.0)], now_ms=1000,
+        account_equity=50, daily_pnl=0, daily_r=0, recent_outcomes=[],
+    )
+    assert result.action == "error"
+    assert result.error == "invalid_scale_fraction"
+
+
+def test_strategy_accepts_scale_out_valid_fraction(monkeypatch):
+    from hliq_bot.ai.client import AICallResult
+    from unittest.mock import MagicMock
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    s = AIStrategy(_ai_cfg(enabled=True))
+    s._llm = MagicMock()
+    s._llm.chat_json.return_value = AICallResult(
+        decision={
+            "action": "scale_out", "confidence": 0.6, "reasoning": "take half",
+            "stop_price": None, "tp1_price": None, "tp2_price": None,
+            "new_stop_price": None, "scale_fraction": 0.5,
+            "add_qty_fraction": None,
+        },
+        raw_text="{}", model="test", prompt_tokens=10, completion_tokens=5,
+        cost_usd=0.0, latency_ms=10, finish_reason="stop",
+    )
+    result = s.decide_for_coin(
+        _FakeWorker(), bars=[_bar(0, 100.0)], now_ms=1000,
+        account_equity=50, daily_pnl=0, daily_r=0, recent_outcomes=[],
+    )
+    assert result.action == "scale_out"
+    assert result.scale_fraction == 0.5
 
 
 def test_build_user_message_contains_context():
     msg = build_user_message({"coin": "BTC", "x": 1})
     assert "BTC" in msg
     assert "Decide" in msg
+
+
+# ---- Memory persistence ----
+
+
+def test_memory_records_decision_and_outcome(tmp_path):
+    from hliq_bot.ai.memory import AIMemory, MemoryEntry
+    mem = AIMemory(tmp_path / "ai_memory.jsonl", max_entries=5)
+    mem.record_decision(MemoryEntry(
+        decision_id="d1", ts_ms=1000, coin="BTC",
+        action="open_long", reasoning="r", confidence=0.7,
+        stop_price=99.0, entry_price=100.0,
+    ))
+    assert mem.record_outcome(
+        "d1", ts_ms=2000, exit_reason="tp1",
+        pnl=0.5, r_multiple=1.2, hold_sec=120.0,
+    )
+    entries = mem.recent_for_prompt(coin="BTC", limit=5)
+    assert len(entries) == 1
+    assert entries[0]["r"] == 1.2
+    assert entries[0]["exit"] == "tp1"
+
+
+def test_memory_persists_and_reloads(tmp_path):
+    from hliq_bot.ai.memory import AIMemory, MemoryEntry
+    path = tmp_path / "ai_memory.jsonl"
+    mem1 = AIMemory(path, max_entries=10)
+    mem1.record_decision(MemoryEntry(
+        decision_id="x1", ts_ms=1000, coin="ETH",
+        action="open_short", reasoning="r", confidence=0.5,
+    ))
+    mem1.record_outcome("x1", ts_ms=2000, exit_reason="stop",
+                       pnl=-0.5, r_multiple=-1.0, hold_sec=60.0)
+    # Re-open the same file in a fresh instance — should reconstruct state.
+    mem2 = AIMemory(path, max_entries=10)
+    mem2.load()
+    stats = mem2.summary_stats()
+    assert stats["total_decisions"] == 1
+    assert stats["resolved_trades"] == 1
+    assert stats["wins"] == 0
+    assert stats["total_pnl"] == pytest.approx(-0.5)
+
+
+def test_memory_summary_stats_empty(tmp_path):
+    from hliq_bot.ai.memory import AIMemory
+    mem = AIMemory(tmp_path / "ai_memory.jsonl")
+    s = mem.summary_stats()
+    assert s["total_decisions"] == 0
+    assert s["resolved_trades"] == 0
+
+
+def test_memory_trims_to_max(tmp_path):
+    from hliq_bot.ai.memory import AIMemory, MemoryEntry
+    mem = AIMemory(tmp_path / "m.jsonl", max_entries=3)
+    for i in range(5):
+        mem.record_decision(MemoryEntry(
+            decision_id=f"d{i}", ts_ms=1000 + i, coin="BTC",
+            action="hold", reasoning="r", confidence=0.5,
+        ))
+    # Only the 3 most recent should be in memory after trim.
+    assert mem.summary_stats()["total_decisions"] == 3
+
+
+# ---- Resilient client ----
+
+
+def test_resilient_llm_retries_then_succeeds():
+    from hliq_bot.ai.client import (
+        AICallResult, AIRetryableError, OpenRouterClient, ResilientLLM,
+    )
+    primary = MagicMock(spec=OpenRouterClient)
+    primary.model = "primary-model"
+    # fail once, succeed on retry
+    primary.chat_json.side_effect = [
+        AIRetryableError("timeout"),
+        AICallResult(decision={"action": "hold"}, raw_text="{}", model="primary-model",
+                     prompt_tokens=10, completion_tokens=5, cost_usd=0.001,
+                     latency_ms=100, finish_reason="stop"),
+    ]
+    llm = ResilientLLM(primary=primary, max_retries=2, retry_base_sec=0.001)
+    result = llm.chat_json(system="s", user="u")
+    assert result.decision["action"] == "hold"
+    assert primary.chat_json.call_count == 2
+
+
+def test_resilient_llm_falls_back_after_primary_exhausted():
+    from hliq_bot.ai.client import (
+        AICallResult, AIRetryableError, OpenRouterClient, ResilientLLM,
+    )
+    primary = MagicMock(spec=OpenRouterClient)
+    primary.model = "primary"
+    primary.chat_json.side_effect = AIRetryableError("primary down")
+    secondary = MagicMock(spec=OpenRouterClient)
+    secondary.model = "secondary"
+    secondary.chat_json.return_value = AICallResult(
+        decision={"action": "hold"}, raw_text="{}", model="secondary",
+        prompt_tokens=10, completion_tokens=5, cost_usd=0.001,
+        latency_ms=100, finish_reason="stop",
+    )
+    llm = ResilientLLM(primary=primary, fallbacks=[secondary],
+                       max_retries=1, retry_base_sec=0.001)
+    result = llm.chat_json(system="s", user="u")
+    assert result.model == "secondary"
+    # primary was retried, then secondary was called once.
+    assert primary.chat_json.call_count == 2
+    assert secondary.chat_json.call_count == 1
+
+
+def test_resilient_llm_circuit_breaker_opens_after_threshold():
+    from hliq_bot.ai.client import (
+        AIClientError, AIRetryableError, OpenRouterClient, ResilientLLM,
+    )
+    primary = MagicMock(spec=OpenRouterClient)
+    primary.model = "primary"
+    primary.chat_json.side_effect = AIRetryableError("down")
+    llm = ResilientLLM(primary=primary, max_retries=2, retry_base_sec=0.001,
+                       cb_threshold=3, cb_cool_down_sec=300)
+    # First call should exhaust retries (3 calls = primary 1 + retries 2)
+    with pytest.raises(AIClientError):
+        llm.chat_json(system="s", user="u")
+    # Breaker should now be open (3 failures >= threshold)
+    assert llm.circuit_open()
+    # Subsequent call short-circuits with "circuit_breaker_open"
+    with pytest.raises(AIClientError, match="circuit_breaker_open"):
+        llm.chat_json(system="s", user="u")
+
+
+def test_resilient_llm_breaker_does_not_open_below_threshold():
+    from hliq_bot.ai.client import (
+        AIClientError, AIRetryableError, OpenRouterClient, ResilientLLM,
+    )
+    primary = MagicMock(spec=OpenRouterClient)
+    primary.model = "primary"
+    primary.chat_json.side_effect = AIRetryableError("down")
+    llm = ResilientLLM(primary=primary, max_retries=1, retry_base_sec=0.001,
+                       cb_threshold=10, cb_cool_down_sec=60)
+    with pytest.raises(AIClientError):
+        llm.chat_json(system="s", user="u")
+    # Only 2 failures (< 10 threshold) — breaker stays closed.
+    assert not llm.circuit_open()
+
+
+def test_resilient_llm_resets_breaker_on_success():
+    from hliq_bot.ai.client import (
+        AICallResult, AIRetryableError, OpenRouterClient, ResilientLLM,
+    )
+    primary = MagicMock(spec=OpenRouterClient)
+    primary.model = "primary"
+    primary.chat_json.side_effect = [
+        AIRetryableError("d"),
+        AICallResult(decision={"action": "hold"}, raw_text="{}", model="primary",
+                     prompt_tokens=10, completion_tokens=5, cost_usd=0,
+                     latency_ms=10, finish_reason="stop"),
+        AIRetryableError("d"),
+        AIRetryableError("d"),
+    ]
+    llm = ResilientLLM(primary=primary, max_retries=3, retry_base_sec=0.001,
+                       cb_threshold=3, cb_cool_down_sec=60)
+    # First call: retries once and succeeds. Counter goes 1 -> 0.
+    result = llm.chat_json(system="s", user="u")
+    assert result.decision["action"] == "hold"
+    # Sanity: breaker reset.
+    assert not llm.circuit_open()
+    assert llm._cb.consecutive_failures == 0
