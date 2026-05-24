@@ -13,6 +13,7 @@ import threading
 import time
 from typing import Any
 
+from hliq_bot.ai.strategy import AIDecisionResult, AIStrategy
 from hliq_bot.analytics.market_capture import MarketCaptureWriter
 from hliq_bot.analytics.journal import SignalJournal
 from hliq_bot.config import AppConfig
@@ -83,6 +84,9 @@ class CoinWorker:
     last_ask_size: float = 0.0
     recent_bar_ranges: deque = field(default_factory=lambda: deque(maxlen=20))
     recent_closes: deque = field(default_factory=lambda: deque(maxlen=25))
+    # Full Bar objects (not just closes) — needed for the AI strategy's
+    # context window. Sized to fit the largest reasonable context_bars.
+    recent_bars: deque = field(default_factory=lambda: deque(maxlen=120))
     recent_trade_prices: deque = field(default_factory=deque)
     recent_signed_flow: deque = field(default_factory=deque)
     bars_closed: int = 0
@@ -197,6 +201,29 @@ class SweepBot:
         now_ms = self._now_ms()
         self._last_auto_train_ms = now_ms
         self._last_auto_train_resolved = self._resolved_trades
+
+        # AI strategy: when enabled, polls an LLM per coin on a timer and
+        # acts on its decisions instead of the rule-based sweep detector.
+        self.ai_strategy: AIStrategy | None = None
+        if config.ai.enabled:
+            self.ai_strategy = AIStrategy(config.ai)
+            # AI strategy wants longer holds than sweep — raise the executor's
+            # time-stop so positions can run as long as the AI intends. Don't
+            # shrink: the existing value is the operator's choice.
+            if config.ai.max_holding_sec > config.strategy.max_holding_sec:
+                log.info(
+                    "AI mode: raising strategy.max_holding_sec %d -> %d to match BOT_AI_MAX_HOLDING_SEC",
+                    config.strategy.max_holding_sec, config.ai.max_holding_sec,
+                )
+                config.strategy.max_holding_sec = config.ai.max_holding_sec
+            log.info(
+                "AI strategy ENABLED: provider=%s model=%s interval=%ds budget=$%.2f/day max_holding=%ds",
+                config.ai.provider, config.ai.model, config.ai.interval_sec,
+                config.ai.daily_budget_usd, config.ai.max_holding_sec,
+            )
+        # Buffer of recent AI-driven closed trades for self-reflection in
+        # later prompts. Trimmed to last 10 for token efficiency.
+        self._ai_recent_outcomes: list[dict] = []
 
     @property
     def _first_worker(self) -> CoinWorker:
@@ -859,6 +886,19 @@ class SweepBot:
                     level_label=level_label,
                 )
                 self._resolved_trades += 1
+                # Self-reflection buffer for the AI's next prompt — compact
+                # record of recent outcomes so it can adapt its tactics.
+                if self.ai_strategy is not None:
+                    self._ai_recent_outcomes.append({
+                        "side": update.closed_trade.side.value,
+                        "exit_reason": update.closed_trade.exit_reason,
+                        "r_multiple": round(update.closed_trade.r_multiple, 3),
+                        "pnl": round(update.closed_trade.pnl, 4),
+                        "session": session,
+                    })
+                    # Keep only last 10 — context budget.
+                    if len(self._ai_recent_outcomes) > 10:
+                        self._ai_recent_outcomes = self._ai_recent_outcomes[-10:]
                 if ml_prob is not None:
                     self.ml_gate.register_outcome(
                         probability=ml_prob,
@@ -880,8 +920,14 @@ class SweepBot:
             w.bars_closed += 1
             w.recent_bar_ranges.append(bar.range_pct)
             w.recent_closes.append(bar.close)
+            w.recent_bars.append(bar)
             w.session_tracker.on_bar(bar)
             w.vwap_tracker.on_bar(bar)
+            # AI mode: every bar close, check if it's this coin's turn to decide.
+            # Skip the rule-based sweep detector entirely when AI is driving.
+            if self.ai_strategy is not None:
+                self._maybe_ai_decide(w, bar)
+                continue
             signal = w.detector.on_bar(bar)
             if signal is None:
                 continue
@@ -1910,6 +1956,215 @@ class SweepBot:
                 summary = ", ".join(f"{k}={v}" for k, v in diag)
                 log.info("Detector diagnostics [%s]: %s", w.coin, summary)
         self._maybe_auto_train()
+
+    def _maybe_ai_decide(self, w: CoinWorker, bar: Bar) -> None:
+        """Poll the AI strategy for this coin if its decision cadence has elapsed."""
+        if self.ai_strategy is None:
+            return
+        now_ms = bar.end_ms
+        if not self.ai_strategy.should_decide(w.coin, now_ms):
+            return
+        result = self.ai_strategy.decide_for_coin(
+            w,
+            bars=list(w.recent_bars),
+            now_ms=now_ms,
+            account_equity=self.risk.equity,
+            daily_pnl=self.risk.daily_pnl,
+            daily_r=self.risk.daily_r,
+            recent_outcomes=list(self._ai_recent_outcomes),
+        )
+        self._handle_ai_decision(w, bar, result)
+
+    def _handle_ai_decision(self, w: CoinWorker, bar: Bar, result: AIDecisionResult) -> None:
+        """Journal the AI decision and act on it."""
+        # Journal every decision (including hold / skip / error) for offline analysis.
+        decision_id = self._next_signal_id(bar.end_ms)
+        self.journal.write(
+            "ai_decision",
+            decision_id,
+            {
+                "ts_ms": bar.end_ms,
+                "coin": w.coin,
+                "action": result.action,
+                "confidence": result.confidence,
+                "reasoning": result.reasoning,
+                "cost_usd": result.cost_usd,
+                "latency_ms": result.latency_ms,
+                "model": result.model,
+                "error": result.error,
+                "skip_reason": result.skip_reason,
+                "budget_spent_24h": round(self.ai_strategy.budget.spent_last_24h(now_ms=bar.end_ms), 6) if self.ai_strategy else 0.0,
+            },
+        )
+        if result.action in {"hold", "skipped", "error"}:
+            return
+
+        if result.action == "close":
+            self._ai_force_close(w, bar, decision_id, result.reasoning)
+            return
+
+        if result.action in {"open_long", "open_short"} and result.signal is not None:
+            self._ai_open_position(w, bar, decision_id, result)
+
+    def _ai_force_close(self, w: CoinWorker, bar: Bar, decision_id: str, reason: str) -> None:
+        """Force-close an open position. Done by tightening stop_price to the
+        current mid so the executor's normal stop logic fires on next tick.
+        Idempotent: no-op if there's no position."""
+        executor = w.executor
+        position = getattr(executor, "position", None)
+        if position is None:
+            log.info("AI close requested for %s but no open position; skipping", w.coin)
+            return
+        mid = (w.last_best_bid + w.last_best_ask) / 2.0 if (w.last_best_bid and w.last_best_ask) else bar.close
+        # Set stop to current price on the LOSING side so next trade triggers exit.
+        # Tiny offset of 1 bps to ensure the comparison fires immediately.
+        if position.side == Side.LONG:
+            position.stop_price = mid * 1.0001
+        else:
+            position.stop_price = mid * 0.9999
+        # For HL executor, propagate to the resting native stop too.
+        if hasattr(executor, "_replace_native_stop"):
+            try:
+                executor._replace_native_stop()
+            except Exception as exc:
+                log.warning("AI force-close: native stop replace failed for %s: %s", w.coin, exc)
+        self.journal.write(
+            "decision",
+            decision_id,
+            {
+                "ts_ms": bar.end_ms,
+                "allowed": False,
+                "coin": w.coin,
+                "reason": "ai_close",
+                "ai_reasoning": reason,
+            },
+        )
+        log.info("AI force-close armed for %s (mid=%.6f): %s", w.coin, mid, reason[:120])
+
+    def _ai_open_position(self, w: CoinWorker, bar: Bar, decision_id: str, result: AIDecisionResult) -> None:
+        """Open a position from an AI decision. Reuses the existing safety stack:
+        operator pause, blocklist, risk governor, executor pre-flight."""
+        signal = result.signal
+        if signal is None:
+            return
+        # Reject if already exposed: AI is not allowed to ladder. To switch
+        # sides, AI must `close` first; next cycle can re-evaluate.
+        if w.executor.has_exposure():
+            self.journal.write(
+                "decision",
+                decision_id,
+                {
+                    "ts_ms": bar.end_ms,
+                    "allowed": False,
+                    "coin": w.coin,
+                    "reason": "ai_open_blocked_existing_exposure",
+                    "ai_reasoning": result.reasoning,
+                },
+            )
+            log.info("AI %s blocked: existing exposure on %s", result.action, w.coin)
+            return
+        # Honor operator pause (but not the sweep-strategy edge_check pause —
+        # that gate doesn't apply to AI signals).
+        pause = self._runtime_pause_reason()
+        if pause is not None and "edge_check" not in pause:
+            self.journal.write(
+                "decision",
+                decision_id,
+                {
+                    "ts_ms": bar.end_ms,
+                    "allowed": False,
+                    "coin": w.coin,
+                    "reason": pause,
+                    "ai_reasoning": result.reasoning,
+                },
+            )
+            log.info("AI %s blocked by operator pause: %s", result.action, pause)
+            return
+        # Risk governor (daily loss, cooldowns, etc.)
+        state = self._build_market_state_w(w, bar.end_ms)
+        risk_check = self.risk.can_open_new_trade(state)
+        if not risk_check.allowed:
+            self.journal.write(
+                "decision",
+                decision_id,
+                {
+                    "ts_ms": bar.end_ms,
+                    "allowed": False,
+                    "coin": w.coin,
+                    "reason": f"risk_governor:{risk_check.reason}",
+                    "ai_reasoning": result.reasoning,
+                },
+            )
+            log.info("AI %s blocked by risk governor: %s", result.action, risk_check.reason)
+            return
+        sizing = self.risk.size_position(
+            signal.entry_price,
+            signal.stop_price,
+            risk_multiplier=self.cfg.ai.risk_multiplier,
+        )
+        if sizing.qty <= 0:
+            self.journal.write(
+                "decision",
+                decision_id,
+                {
+                    "ts_ms": bar.end_ms,
+                    "allowed": False,
+                    "coin": w.coin,
+                    "reason": "size_zero",
+                    "ai_reasoning": result.reasoning,
+                },
+            )
+            log.info("AI %s blocked: sizer returned 0 qty (risk too small?)", result.action)
+            return
+        # Submit. Reuses the executor's full safety pre-flight.
+        try:
+            update = w.executor.submit_entry(
+                signal,
+                signal_id=decision_id,
+                qty=sizing.qty,
+                risk_dollars=sizing.risk_dollars,
+            )
+        except Exception as exc:
+            log.warning("AI submit_entry error for %s: %s", w.coin, exc, exc_info=True)
+            self.journal.write(
+                "decision",
+                decision_id,
+                {
+                    "ts_ms": bar.end_ms,
+                    "allowed": False,
+                    "coin": w.coin,
+                    "reason": f"submit_entry_error:{type(exc).__name__}",
+                    "ai_reasoning": result.reasoning,
+                },
+            )
+            return
+        self.journal.write(
+            "decision",
+            decision_id,
+            {
+                "ts_ms": bar.end_ms,
+                "allowed": update.event_type == ExecEventType.ENTRY_PLACED,
+                "coin": w.coin,
+                "reason": "ai_open",
+                "ai_reasoning": result.reasoning,
+                "qty": sizing.qty,
+                "risk_dollars": sizing.risk_dollars,
+            },
+        )
+        self.journal.write(
+            "lifecycle",
+            decision_id,
+            {
+                "ts_ms": update.ts_ms,
+                "event": update.event_type.value,
+                "message": update.message,
+                "coin": w.coin,
+            },
+        )
+        if update.event_type == ExecEventType.ENTRY_PLACED:
+            self._entries_placed += 1
+            w.entries_placed += 1
+        log.info("AI %s on %s: %s", result.action, w.coin, update.message)
 
     def _maybe_refresh_deadmans(self, now_ms: int) -> None:
         """Push HL's schedule_cancel timer forward when the per-executor refresh

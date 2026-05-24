@@ -259,6 +259,42 @@ def _fetch_candles(
     return rows, counts
 
 
+def _invert_signal(signal):
+    """Return a new SweepSignal that flips side and mirrors stop/TPs around entry.
+
+    Used by the --invert-signals experiment. Thesis: if the bot reliably stops
+    out on its own signals, the inverse direction (fading the reclaim, riding
+    the continuation) may have positive edge. Mirroring around entry keeps the
+    R:R ratio identical so the comparison is apples-to-apples.
+    """
+    from hliq_bot.models import SweepSignal, Side
+    e = signal.entry_price
+    new_side = Side.SHORT if signal.side == Side.LONG else Side.LONG
+    # Mirror: dist from entry stays the same magnitude, just flips sign.
+    new_stop = e + (e - signal.stop_price)
+    new_tp1  = e + (e - signal.tp1_price)
+    new_tp2  = e + (e - signal.tp2_price)
+    return SweepSignal(
+        side=new_side,
+        level=signal.level,
+        level_label=signal.level_label,
+        sweep_extreme=signal.sweep_extreme,
+        entry_price=e,
+        stop_price=new_stop,
+        tp1_price=new_tp1,
+        tp2_price=new_tp2,
+        confidence=signal.confidence,
+        reason=f"inverted({signal.reason})",
+        created_ms=signal.created_ms,
+        coin=signal.coin,
+        overshoot_bps=signal.overshoot_bps,
+        reclaim_bps=signal.reclaim_bps,
+        volume_ratio=signal.volume_ratio,
+        wick_ratio=signal.wick_ratio,
+        signal_score=signal.signal_score,
+    )
+
+
 def _selected(cfg, coin: str, signal, session: str, *, ignore_operator_policy: bool = False) -> tuple[bool, str]:
     coin_key = coin.upper()
     if not ignore_operator_policy:
@@ -696,6 +732,13 @@ def main() -> int:
         default=8,
         help="Maximum per-coin slice rows to print. Use 0 to print every slice for machine gates.",
     )
+    parser.add_argument(
+        "--invert-signals",
+        action="store_true",
+        help="EXPERIMENTAL: flip side and mirror stop/TPs around entry on every "
+        "signal before simulation. Use to test the 'fade the reclaim, ride the "
+        "continuation' thesis when the baseline strategy is reliably stopping out.",
+    )
     args = parser.parse_args()
 
     _load_env(ROOT / args.env_file)
@@ -747,6 +790,8 @@ def main() -> int:
             if signal is None:
                 continue
             candidates += 1
+            if args.invert_signals:
+                signal = _invert_signal(signal)
             sess = _session(signal.created_ms)
             ok, reason = _selected(cfg, coin, signal, sess, ignore_operator_policy=args.ignore_operator_policy)
             if not ok:
