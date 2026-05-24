@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 
 
@@ -452,6 +452,40 @@ class LiveConfig:
 
 
 @dataclass(slots=True)
+class AIConfig:
+    """LLM-driven trading strategy settings.
+
+    When enabled=True, the bot's rule-based sweep detector is bypassed and
+    the AIStrategy polls an LLM every interval_sec to decide trades per coin.
+    The LLM has full position-management authority: open, hold, close.
+
+    The risk governor still applies — the AI proposes direction + stop;
+    sizing is computed by RiskGovernor from equity * risk_per_trade_pct.
+    The HyperliquidOrderManager still enforces max_notional, deadman, native
+    stops, etc. The AI cannot bypass any safety layer.
+    """
+    enabled: bool = False
+    # API config — provider currently supports "openrouter" (OpenAI-compatible
+    # API). The API key is read from OPENROUTER_API_KEY env (not stored on the
+    # dataclass to keep secrets out of any future config dump).
+    provider: str = "openrouter"
+    model: str = "google/gemini-3.5-flash"
+    api_base_url: str = "https://openrouter.ai/api/v1"
+    # Per-coin polling cadence and rate limits.
+    interval_sec: int = 300       # 5 min default
+    max_calls_hourly: int = 60    # 60 calls/hour cap = burst safety
+    timeout_sec: float = 30.0
+    # Risk handed to the LLM. The AI proposes side + stop; governor sizes.
+    # max_holding_sec lets us force-close stale AI positions if it forgets.
+    risk_multiplier: float = 1.0
+    max_holding_sec: int = 7200   # 2 hours hard cap
+    # Context window — how many recent 1-min bars to include in the prompt.
+    context_bars: int = 30
+    # Cost tracking budget (USD/day soft cap; logs warning when crossed).
+    daily_budget_usd: float = 5.0
+
+
+@dataclass(slots=True)
 class ReplayConfig:
     input_path: str = "runtime/market_events.jsonl"
 
@@ -466,6 +500,9 @@ class AppConfig:
     replay: ReplayConfig
     levels: LevelConfig
     live: LiveConfig
+    # Default factory so existing AppConfig construction in tests doesn't break
+    # when the AI integration is added; load_config() always populates it.
+    ai: AIConfig = field(default_factory=AIConfig)
 
 
 def load_config() -> AppConfig:
@@ -657,6 +694,20 @@ def load_config() -> AppConfig:
         deadman_refresh_sec=_env_int("HL_DEADMAN_REFRESH_SEC", 30),
     )
 
+    ai = AIConfig(
+        enabled=_env_bool("BOT_AI_ENABLED", False),
+        provider=_env_str("BOT_AI_PROVIDER", "openrouter").lower(),
+        model=_env_str("BOT_AI_MODEL", "google/gemini-3.5-flash"),
+        api_base_url=_env_str("BOT_AI_API_BASE_URL", "https://openrouter.ai/api/v1"),
+        interval_sec=_env_int("BOT_AI_INTERVAL_SEC", 300),
+        max_calls_hourly=_env_int("BOT_AI_MAX_CALLS_HOURLY", 60),
+        timeout_sec=_env_float("BOT_AI_TIMEOUT_SEC", 30.0),
+        risk_multiplier=_env_float("BOT_AI_RISK_MULTIPLIER", 1.0),
+        max_holding_sec=_env_int("BOT_AI_MAX_HOLDING_SEC", 7200),
+        context_bars=_env_int("BOT_AI_CONTEXT_BARS", 30),
+        daily_budget_usd=_env_float("BOT_AI_DAILY_BUDGET_USD", 5.0),
+    )
+
     return AppConfig(
         mode=_env_str("BOT_MODE", "paper").lower(),
         feed=feed,
@@ -666,4 +717,5 @@ def load_config() -> AppConfig:
         replay=replay,
         levels=levels,
         live=live,
+        ai=ai,
     )
