@@ -483,6 +483,10 @@ class AIConfig:
     context_bars: int = 30
     # Cost tracking budget (USD/day soft cap; logs warning when crossed).
     daily_budget_usd: float = 5.0
+    # Max LLM completion tokens per call. 1024 was insufficient for Gemini 3.5
+    # Flash on rich-context prompts — finish_reason="length" truncates JSON
+    # mid-stream. 2048 leaves comfortable headroom; cost impact is small.
+    max_response_tokens: int = 2048
     # Resilience — fallback model chain (comma-separated env). Primary fails →
     # try these in order. Use a strong + cheap mix, e.g. "google/gemini-3.5-flash,
     # anthropic/claude-haiku-4.5". Leave empty for no fallbacks.
@@ -739,6 +743,7 @@ def load_config() -> AppConfig:
         max_holding_sec=_env_int("BOT_AI_MAX_HOLDING_SEC", 7200),
         context_bars=_env_int("BOT_AI_CONTEXT_BARS", 30),
         daily_budget_usd=_env_float("BOT_AI_DAILY_BUDGET_USD", 5.0),
+        max_response_tokens=_env_int("BOT_AI_MAX_RESPONSE_TOKENS", 2048),
         fallback_models_str=_env_str("BOT_AI_FALLBACK_MODELS", ""),
         retry_attempts=_env_int("BOT_AI_RETRY_ATTEMPTS", 3),
         retry_base_sec=_env_float("BOT_AI_RETRY_BASE_SEC", 1.0),

@@ -216,6 +216,11 @@ class AIStrategy:
 
         decision = call.decision
         if not isinstance(decision, dict):
+            log.warning(
+                "AI non_json_response for %s (finish=%s tokens=%d): raw[:300]=%r",
+                coin, call.finish_reason, call.completion_tokens,
+                call.raw_text[:300],
+            )
             return AIDecisionResult(
                 coin=coin, action="error", signal=None,
                 reasoning=call.raw_text[:200], confidence=0.0,
@@ -255,6 +260,7 @@ class AIStrategy:
             user=build_user_message(prompt_dict),
             schema=decision_schema(),
             timeout_sec=self.cfg.timeout_sec,
+            max_tokens=self.cfg.max_response_tokens,
         )
 
     def _build_result(
