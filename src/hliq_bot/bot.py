@@ -465,33 +465,6 @@ class SweepBot:
         reason = reason[:120] or "operator_pause"
         return f"runtime_pause:{reason}"
 
-    def _clear_stale_edge_check_pause(self) -> None:
-        """Delete trade_pause.flag at startup IF it was written by a watcher's
-        edge_check_pending phase. A bot startup implies the watcher either
-        (a) started too and will re-write its flag, or (b) crashed mid-check —
-        in either case the stale "pending" flag should not silently halt trading.
-
-        Operator-set pauses (any other reason string) AND "edge_check_failed"
-        flags are preserved: those are legitimate signals to keep trading off.
-        """
-        path = Path(self.cfg.runtime.trade_pause_path)
-        if not path.exists():
-            return
-        try:
-            content = path.read_text(encoding="utf-8", errors="replace").strip()
-        except OSError:
-            return
-        first = content.splitlines()[0].strip() if content else ""
-        if first == "edge_check_pending":
-            try:
-                path.unlink()
-                log.warning(
-                    "Cleared stale edge_check_pending pause flag at startup (likely from a "
-                    "crashed session_profit_watch). Watcher will re-write if still needed."
-                )
-            except OSError as exc:
-                log.warning("Could not clear stale pause flag %s: %s", path, exc)
-
     def _load_runtime_ml_state(self) -> None:
         path = self._resolve_project_path(self.cfg.runtime.ml_state_path)
         if not path.exists():
@@ -581,11 +554,6 @@ class SweepBot:
             s.warmup_enabled, s.warmup_micro_or_logic, soft_or_active,
             s.regime_filter_enabled, s.min_signal_score,
         )
-        # Defensive: a stale trade_pause.flag from a crashed watcher would
-        # silently halt the bot. If the flag exists at startup AND was written
-        # by the watcher's edge_check_pending path, treat it as stale and clear
-        # it. Operator-set pauses (any other content) are preserved.
-        self._clear_stale_edge_check_pause()
         self._warm_start_history()
         stop_flag = threading.Event()
         worker = threading.Thread(target=self._event_worker, args=(stop_flag,), name="sweepbot-worker", daemon=True)
