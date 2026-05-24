@@ -53,10 +53,11 @@ class AICallResult:
 # add entries when you know the rate, otherwise the budget gate is inert.
 _PRICING_PER_M_TOKENS: dict[str, tuple[float, float]] = {
     # model: (input_price, output_price)
-    # gemini 3.5 flash just released — pricing unconfirmed; update when
-    # known so the daily-budget tracker isn't flying blind.
-    "google/gemini-3.5-flash":       (0.10,  0.40),  # estimate; verify on OpenRouter
-    "google/gemini-2.5-flash":       (0.075, 0.30),
+    # Verified against OpenRouter /api/v1/models 2026-05-24.
+    "google/gemini-3.5-flash":       (1.50,  9.00),  # NOT cheap — ~$0.013/call typical
+    "google/gemini-2.5-flash":       (0.30,  2.50),
+    "google/gemini-2.5-flash-lite":  (0.10,  0.40),  # cheapest viable; ~$0.0006/call
+    "google/gemini-2.0-flash-001":   (0.10,  0.40),
     "google/gemini-2.5-pro":         (1.25,  5.00),
     "anthropic/claude-haiku-4.5":    (1.00,  5.00),
     "anthropic/claude-sonnet-4.6":   (3.00, 15.00),
