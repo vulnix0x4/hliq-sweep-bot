@@ -15,7 +15,7 @@ from typing import Any
 
 from hliq_bot.ai.market_data import MarketDataCache
 from hliq_bot.ai.memory import AIMemory, MemoryEntry
-from hliq_bot.ai.strategy import AIDecisionResult, AIStrategy
+from hliq_bot.ai.strategy import AIDecisionResult, AIStrategy, read_override_flag
 from hliq_bot.analytics.market_capture import MarketCaptureWriter
 from hliq_bot.analytics.journal import SignalJournal
 from hliq_bot.config import AppConfig
@@ -2008,6 +2008,28 @@ class SweepBot:
         now_ms = bar.end_ms
         if not self.ai_strategy.should_decide(w.coin, now_ms):
             return
+        # Operator override flag — short-circuits the LLM call when set.
+        override = read_override_flag(self.cfg.runtime.runtime_dir)
+        if override == "close_all":
+            # Force close every open position; don't waste an LLM call.
+            self.ai_strategy._last_decision_ms[w.coin] = now_ms
+            position = getattr(w.executor, "position", None)
+            if position is not None:
+                decision_id = self._next_signal_id(bar.end_ms)
+                self.journal.write("ai_decision", decision_id, {
+                    "ts_ms": bar.end_ms, "coin": w.coin, "action": "close",
+                    "reasoning": "operator override: close_all",
+                    "confidence": 1.0, "cost_usd": 0.0, "latency_ms": 0,
+                    "model": "operator", "skip_reason": "ai_override:close_all",
+                    "prompt_version": self.cfg.ai.prompt_version,
+                })
+                self._ai_force_close(w, bar, decision_id, "operator override: close_all")
+            return
+        if override in {"pause", "no_new"}:
+            # Don't call the LLM at all — but DO keep managing existing
+            # positions via the regular tick handler. Just skip AI poll.
+            self.ai_strategy._last_decision_ms[w.coin] = now_ms
+            return
         result = self.ai_strategy.decide_for_coin(
             w,
             bars=list(w.recent_bars),
@@ -2124,6 +2146,31 @@ class SweepBot:
         signal = result.signal
         if signal is None:
             return
+        # Correlation gate: most alts are highly correlated, so 4 concurrent
+        # longs is stealth 4x leverage in the same direction. Block when
+        # same-side concurrent open positions already at the configured cap.
+        intended_side = signal.side.value  # "long" or "short"
+        same_side_count = sum(
+            1 for other_w in self._workers.values()
+            if other_w is not w
+            and (pos := getattr(other_w.executor, "position", None)) is not None
+            and pos.side.value == intended_side
+        )
+        if same_side_count >= self.cfg.ai.max_concurrent_same_side:
+            self.journal.write(
+                "decision", decision_id,
+                {
+                    "ts_ms": bar.end_ms, "allowed": False, "coin": w.coin,
+                    "reason": f"ai_correlation_cap:{intended_side}:{same_side_count}",
+                    "ai_reasoning": result.reasoning,
+                },
+            )
+            log.info(
+                "AI %s blocked: %d %s positions already open (cap=%d)",
+                result.action, same_side_count, intended_side,
+                self.cfg.ai.max_concurrent_same_side,
+            )
+            return
         # Reject if already exposed: AI is not allowed to ladder. To switch
         # sides, AI must `close` first; next cycle can re-evaluate.
         if w.executor.has_exposure():
@@ -2174,10 +2221,15 @@ class SweepBot:
             )
             log.info("AI %s blocked by risk governor: %s", result.action, risk_check.reason)
             return
+        # Volatility-targeted sizing — when vol is high, scale risk down so
+        # dollar PnL variance is roughly constant across regimes. Inputs from
+        # the same context object the AI saw, so the AI's risk-talk matches
+        # what actually gets sized.
+        vol_scale = self._ai_vol_target_scale_for(w, bar.end_ms)
         sizing = self.risk.size_position(
             signal.entry_price,
             signal.stop_price,
-            risk_multiplier=self.cfg.ai.risk_multiplier,
+            risk_multiplier=self.cfg.ai.risk_multiplier * vol_scale,
         )
         if sizing.qty <= 0:
             self.journal.write(
@@ -2242,6 +2294,32 @@ class SweepBot:
             self._entries_placed += 1
             w.entries_placed += 1
         log.info("AI %s on %s: %s", result.action, w.coin, update.message)
+
+    def _ai_vol_target_scale_for(self, w: CoinWorker, now_ms: int) -> float:
+        """Compute vol-targeted risk scale for the focus coin.
+
+        Returns 1.0 (no scaling) when vol-targeting is disabled or there's
+        insufficient data. Otherwise returns target_vol / actual_vol clamped
+        to [min_scale, max_scale]. Higher actual vol -> smaller position.
+        """
+        cfg_ai = self.cfg.ai
+        if not cfg_ai.vol_target_enabled:
+            return 1.0
+        # Reuse the same calculation as the context builder so the AI's
+        # reasoning matches the sizing it actually gets.
+        from hliq_bot.ai.context import _realized_vol_bps
+        actual = _realized_vol_bps(
+            list(w.recent_trade_prices), window_ms=5 * 60 * 1000, now_ms=now_ms,
+        )
+        if actual <= 0:
+            return 1.0
+        target = max(1.0, cfg_ai.vol_target_bps)
+        # Cap actual at target/max_scale so we don't size to 0 in a flash crash;
+        # cap below at target/min_scale so we don't blow up in a flat tape.
+        actual_clamped = max(target / cfg_ai.vol_target_max_scale, actual)
+        actual_clamped = min(target / cfg_ai.vol_target_min_scale, actual_clamped)
+        scale = target / actual_clamped
+        return max(cfg_ai.vol_target_min_scale, min(cfg_ai.vol_target_max_scale, scale))
 
     def _ai_move_stop_to_be(self, w: CoinWorker, bar: Bar, decision_id: str, reason: str) -> None:
         position = getattr(w.executor, "position", None)

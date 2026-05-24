@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import logging
 import os
+from pathlib import Path
 import time
 from typing import Any
 
@@ -58,6 +59,26 @@ def _round_to_sig_figs(value: float, sig_figs: int = 5) -> float:
     if value <= 0:
         return value
     return float(f"{value:.{sig_figs}g}")
+
+
+def read_override_flag(runtime_dir: str | Path) -> str | None:
+    """Return the AI override mode set by an operator script, or None.
+
+    Modes: "pause"|"no_new" — block new opens; "close_all" — also force-close.
+    """
+    path = Path(runtime_dir) / "ai_override.flag"
+    if not path.exists():
+        return None
+    try:
+        first = path.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+        if not first:
+            return None
+        mode = first[0].strip().lower()
+        if mode in {"pause", "no_new", "close_all"}:
+            return mode
+        return mode  # surface anything weird so operator sees it
+    except OSError:
+        return None
 
 
 class AIStrategy:

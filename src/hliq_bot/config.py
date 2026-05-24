@@ -500,6 +500,18 @@ class AIConfig:
     # Prompt version label — recorded on every decision row so reports can
     # split performance by prompt iteration. Bump when you change the prompt.
     prompt_version: str = "v1"
+    # Concurrency control — most retail alt coins are highly correlated, so
+    # opening 4 longs at once is stealth 4x leverage in the same direction.
+    # When the AI attempts an open, block if this many same-side positions
+    # are already open across all coins.
+    max_concurrent_same_side: int = 2
+    # Volatility-targeted sizing — scale the AI's risk_multiplier inversely
+    # with the focus coin's realized 5m vol so dollar risk is roughly
+    # constant across regimes. risk_mult = target / max(actual, target/cap).
+    vol_target_enabled: bool = True
+    vol_target_bps: float = 30.0       # "normal" realized 5m vol target
+    vol_target_min_scale: float = 0.4  # never below 0.4x in extreme vol
+    vol_target_max_scale: float = 1.5  # never above 1.5x in very quiet tape
 
     @property
     def fallback_models(self) -> list[str]:
@@ -735,6 +747,11 @@ def load_config() -> AppConfig:
         memory_path=_env_str("BOT_AI_MEMORY_PATH", "runtime/ai_memory.jsonl"),
         memory_max_entries=_env_int("BOT_AI_MEMORY_MAX", 50),
         prompt_version=_env_str("BOT_AI_PROMPT_VERSION", "v1"),
+        max_concurrent_same_side=_env_int("BOT_AI_MAX_CONCURRENT_SAME_SIDE", 2),
+        vol_target_enabled=_env_bool("BOT_AI_VOL_TARGET_ENABLED", True),
+        vol_target_bps=_env_float("BOT_AI_VOL_TARGET_BPS", 30.0),
+        vol_target_min_scale=_env_float("BOT_AI_VOL_TARGET_MIN_SCALE", 0.4),
+        vol_target_max_scale=_env_float("BOT_AI_VOL_TARGET_MAX_SCALE", 1.5),
     )
 
     return AppConfig(

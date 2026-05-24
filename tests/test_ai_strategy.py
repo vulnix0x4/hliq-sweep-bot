@@ -372,6 +372,17 @@ def test_strategy_validates_scale_out_fraction_range(monkeypatch):
     assert result.error == "invalid_scale_fraction"
 
 
+def test_read_override_flag_recognizes_modes(tmp_path):
+    from hliq_bot.ai.strategy import read_override_flag
+    assert read_override_flag(tmp_path) is None
+    (tmp_path / "ai_override.flag").write_text("close_all\n")
+    assert read_override_flag(tmp_path) == "close_all"
+    (tmp_path / "ai_override.flag").write_text("pause")
+    assert read_override_flag(tmp_path) == "pause"
+    (tmp_path / "ai_override.flag").write_text("no_new")
+    assert read_override_flag(tmp_path) == "no_new"
+
+
 def test_strategy_accepts_scale_out_valid_fraction(monkeypatch):
     from hliq_bot.ai.client import AICallResult
     from unittest.mock import MagicMock
