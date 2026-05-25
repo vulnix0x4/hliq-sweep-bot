@@ -360,6 +360,42 @@ class CostBudget:
             now_ms = int(time.time() * 1000)
         self._calls.append((now_ms, max(0.0, cost_usd)))
 
+    def prime_from_journal(self, journal_path: str) -> int:
+        """Restore the rolling 24h spend from past ai_decision rows in the
+        journal. Without this, a container restart resets the budget tracker
+        to $0 and the daily cap can be exceeded 2-3x per day across restarts.
+        Returns the number of past entries loaded."""
+        from pathlib import Path
+        p = Path(journal_path)
+        if not p.exists():
+            return 0
+        now_ms = int(time.time() * 1000)
+        cutoff = now_ms - 24 * 60 * 60 * 1000
+        loaded = 0
+        try:
+            with p.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or '"ai_decision"' not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if row.get("event_type") != "ai_decision":
+                        continue
+                    ts = int(row.get("ts_ms") or 0)
+                    if ts < cutoff:
+                        continue
+                    cost = float(row.get("cost_usd") or 0)
+                    if cost <= 0:
+                        continue
+                    self._calls.append((ts, cost))
+                    loaded += 1
+        except OSError:
+            pass
+        return loaded
+
     def spent_last_24h(self, now_ms: int | None = None) -> float:
         if now_ms is None:
             now_ms = int(time.time() * 1000)

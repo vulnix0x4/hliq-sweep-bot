@@ -233,6 +233,16 @@ class SweepBot:
             self.ai_strategy = AIStrategy(
                 config.ai, memory=self.ai_memory, market_data=self.ai_market_data,
             )
+            # Prime the rolling-24h cost tracker from journal so restarting the
+            # container doesn't reset the daily-budget cap to $0 — otherwise
+            # several restarts in a day let the bot spend N x the cap.
+            primed = self.ai_strategy.budget.prime_from_journal(config.runtime.journal_path)
+            if primed > 0:
+                spent = self.ai_strategy.budget.spent_last_24h()
+                log.info(
+                    "AI cost tracker primed from journal: %d past calls in 24h window, spent=$%.4f / cap=$%.2f",
+                    primed, spent, config.ai.daily_budget_usd,
+                )
             # AI strategy wants longer holds than sweep — raise the executor's
             # time-stop so positions can run as long as the AI intends. Don't
             # shrink: the existing value is the operator's choice.

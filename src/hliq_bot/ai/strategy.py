@@ -95,7 +95,8 @@ class AIStrategy:
         self._last_decision_ms: dict[str, int] = {}
         # Per-call timestamps for hourly rate limit (across all coins).
         self._call_times_ms: list[int] = []
-        # Cost tracker (24h rolling window).
+        # Cost tracker (24h rolling window). Will be primed from journal
+        # by the bot during __init__ so restarts don't reset the daily cap.
         self.budget = CostBudget(cfg.daily_budget_usd)
         # Persistent AI trade memory (optional — callers pass it in).
         self.memory: AIMemory | None = memory
