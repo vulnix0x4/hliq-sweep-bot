@@ -64,10 +64,9 @@ rather than closed-and-reopened, because fees and slippage compound.
   elsewhere — concentration risk.
 
 # Reasoning
-Always write `reasoning` — ONE short sentence (max 30 words) citing specific
-context elements (e.g. "flow_bias_5m=+0.62 + breakout above 60.5 level +
-day_change +1.8% sympathy with BTC"). Keep it terse. This is logged for
-offline review.
+Always write `reasoning` — ONE sentence, MAX 20 words. Cite specific
+numbers (e.g. "flow_bias=+0.62, broke 60.5"). Output tokens are expensive;
+do not write paragraphs. This field is logged for offline review.
 """
 
 
