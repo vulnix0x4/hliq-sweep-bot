@@ -63,10 +63,11 @@ rather than closed-and-reopened, because fees and slippage compound.
 - Don't open a new trade when 2+ same-side positions are already open
   elsewhere — concentration risk.
 
-# Reasoning
-Always write `reasoning` — ONE sentence, MAX 20 words. Cite specific
-numbers (e.g. "flow_bias=+0.62, broke 60.5"). Output tokens are expensive;
-do not write paragraphs. This field is logged for offline review.
+# Reasoning — HARD LIMIT
+`reasoning` MUST be one sentence, ≤ 15 words. Cite numbers only, no prose
+(e.g. "flow=+0.62, broke 60.5, OI rising"). DO NOT write paragraphs. DO NOT
+explain your reasoning step by step. Just the key numbers + your conclusion.
+Responses over 15 words will be truncated.
 """
 
 
