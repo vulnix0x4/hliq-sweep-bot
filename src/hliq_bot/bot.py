@@ -1446,21 +1446,20 @@ class SweepBot:
     def _build_market_state(self, ts_ms: int) -> MarketState:
         now_ms = self._now_ms()
         stale_ms = self.cfg.feed.stale_data_sec * 1000
-        data_stale = self._last_event_ms == 0 or (now_ms - self._last_event_ms > stale_ms)
+        # Staleness is determined by when the WS *received* its last message,
+        # not when the worker last *processed* an event. The worker can be
+        # blocked for seconds inside a LLM call, but that doesn't mean the
+        # feed itself is stale. Replay mode has no live feed, so it falls
+        # back to processed-event time.
         if self.cfg.mode == "replay":
-            ws_healthy = self._last_event_ms > 0 and not data_stale
+            last_seen_ms = self._last_event_ms
         else:
-            ws_healthy = self.feed.last_message_ms > 0 and not data_stale
-        # Track last-healthy timestamp + accept a 30s grace window. A
-        # millisecond-scale WS flap shouldn't kill a trade signal that the
-        # AI spent 2-3 seconds reasoning over. If the feed is genuinely
-        # down for >30s, the strict check still fires.
-        if ws_healthy:
-            self._ws_last_healthy_ms = now_ms
-        recently_healthy = (now_ms - self._ws_last_healthy_ms) <= 30_000
+            last_seen_ms = self.feed.last_message_ms or self._last_event_ms
+        data_stale = last_seen_ms == 0 or (now_ms - last_seen_ms > stale_ms)
+        ws_healthy = last_seen_ms > 0 and not data_stale
         return MarketState(
             ts_ms=ts_ms,
-            ws_healthy=ws_healthy or recently_healthy,
+            ws_healthy=ws_healthy,
             data_stale=data_stale,
             spread_bps=self._last_spread_bps,
             recent_bar_ranges_pct=list(self._recent_bar_ranges),
@@ -1800,18 +1799,15 @@ class SweepBot:
     def _build_market_state_w(self, w: CoinWorker, ts_ms: int) -> MarketState:
         now_ms = self._now_ms()
         stale_ms = self.cfg.feed.stale_data_sec * 1000
-        data_stale = self._last_event_ms == 0 or (now_ms - self._last_event_ms > stale_ms)
         if self.cfg.mode == "replay":
-            ws_healthy = self._last_event_ms > 0 and not data_stale
+            last_seen_ms = self._last_event_ms
         else:
-            ws_healthy = self.feed.last_message_ms > 0 and not data_stale
-        # 30s grace window — see _build_market_state for rationale.
-        if ws_healthy:
-            self._ws_last_healthy_ms = now_ms
-        recently_healthy = (now_ms - self._ws_last_healthy_ms) <= 30_000
+            last_seen_ms = self.feed.last_message_ms or self._last_event_ms
+        data_stale = last_seen_ms == 0 or (now_ms - last_seen_ms > stale_ms)
+        ws_healthy = last_seen_ms > 0 and not data_stale
         return MarketState(
             ts_ms=ts_ms,
-            ws_healthy=ws_healthy or recently_healthy,
+            ws_healthy=ws_healthy,
             data_stale=data_stale,
             spread_bps=w.last_spread_bps,
             recent_bar_ranges_pct=list(w.recent_bar_ranges),
