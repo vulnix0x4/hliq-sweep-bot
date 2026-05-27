@@ -182,6 +182,9 @@ class SweepBot:
         self._resolved_trades = self._restore_risk_from_journal()
 
         self._last_event_ms = 0
+        # Last time we observed WS healthy. Used as a 30s grace window so a
+        # momentary feed flap doesn't kill an in-flight AI trade decision.
+        self._ws_last_healthy_ms = 0
         self._heartbeat_interval_ms = 60_000
         now_ms = self._now_ms()
         self._write_run_start(now_ms)
@@ -1448,9 +1451,16 @@ class SweepBot:
             ws_healthy = self._last_event_ms > 0 and not data_stale
         else:
             ws_healthy = self.feed.last_message_ms > 0 and not data_stale
+        # Track last-healthy timestamp + accept a 30s grace window. A
+        # millisecond-scale WS flap shouldn't kill a trade signal that the
+        # AI spent 2-3 seconds reasoning over. If the feed is genuinely
+        # down for >30s, the strict check still fires.
+        if ws_healthy:
+            self._ws_last_healthy_ms = now_ms
+        recently_healthy = (now_ms - self._ws_last_healthy_ms) <= 30_000
         return MarketState(
             ts_ms=ts_ms,
-            ws_healthy=ws_healthy,
+            ws_healthy=ws_healthy or recently_healthy,
             data_stale=data_stale,
             spread_bps=self._last_spread_bps,
             recent_bar_ranges_pct=list(self._recent_bar_ranges),
@@ -1795,9 +1805,13 @@ class SweepBot:
             ws_healthy = self._last_event_ms > 0 and not data_stale
         else:
             ws_healthy = self.feed.last_message_ms > 0 and not data_stale
+        # 30s grace window — see _build_market_state for rationale.
+        if ws_healthy:
+            self._ws_last_healthy_ms = now_ms
+        recently_healthy = (now_ms - self._ws_last_healthy_ms) <= 30_000
         return MarketState(
             ts_ms=ts_ms,
-            ws_healthy=ws_healthy,
+            ws_healthy=ws_healthy or recently_healthy,
             data_stale=data_stale,
             spread_bps=w.last_spread_bps,
             recent_bar_ranges_pct=list(w.recent_bar_ranges),
